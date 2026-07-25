@@ -62,7 +62,7 @@ test.describe("Workbench client", function()
       workspace_id = workspace_id,
     })
     local second = assert(Client.open {
-      backend = "fake",
+      backend = "in_process",
       workspace_id = workspace_id,
     })
 
@@ -89,4 +89,3 @@ test.describe("Workbench client", function()
     test.ok(not client:is_open())
   end)
 end)
-
