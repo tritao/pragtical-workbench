@@ -326,8 +326,10 @@ The agent vertical slice is now implemented on POSIX: a small embedded-Lua
 `workbench-agent` executable loads the same service, uses the shared framed
 MessagePack protocol over a Unix socket, and supports handshake/capabilities,
 commands, snapshots, subscriptions, replay recovery, and SQLite-backed
-reconnect. Terminal process ownership, terminal output streaming, and Windows
-named-pipe transport remain to be completed.
+reconnect. The agent now also owns POSIX PTYs, persists raw output history,
+streams bounded output events, accepts input and resize commands, and serves
+byte-offset replay after client reconnect. ConPTY and Windows named-pipe
+transport remain to be completed.
 
 ### Phase 1 — Pure-Lua service
 
@@ -345,22 +347,24 @@ handling, and local layout state against a fake backend.
 Connect the Pragtical client to the shared Lua service and verify that every
 domain mutation still flows through commands.
 
-### Phase 4 — Native terminal vertical slice
+### Phase 4 — Native terminal vertical slice (implemented on POSIX)
 
 Implement POSIX PTY support, a mock PTY, terminal emulation, event queues,
 `TerminalView`, start/stop/detach/reattach, resize, and large-output handling.
-Add ConPTY after POSIX is stable.
+The POSIX PTY and in-process path are implemented; add ConPTY after POSIX is
+stable.
 
 ### Phase 5 — SQLite persistence
 
 Add the Lua-owned schema and migrations, native SQLite binding, transactional
 commands, operation history, bounded event journal, and runtime metadata.
 
-### Phase 6 — Agent host
+### Phase 6 — Agent host (POSIX vertical slice implemented)
 
 Add the embedded-Lua daemon, IPC transport, MessagePack schemas, handshake,
 capabilities, subscriptions, reconnect, snapshot recovery, and terminal offset
-replay.
+replay. The embedded agent, Unix transport, POSIX runtime ownership, history,
+input, resize, and replay are implemented; ConPTY and Windows transport remain.
 
 ### Phase 7 — Sakura importer
 

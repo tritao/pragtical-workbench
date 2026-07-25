@@ -82,6 +82,12 @@ function Service.new(options)
     service.tasks = persisted.tasks or {}
     service.resources = persisted.resources or {}
     service.runtimes = persisted.runtimes or {}
+    for _, runtime in pairs(service.runtimes) do
+      if runtime.resource_id and service.resources[runtime.resource_id]
+          and runtime.status then
+        service.resources[runtime.resource_id].status = runtime.status
+      end
+    end
     service.provider_metadata = persisted.provider_metadata or {}
     service.operations = persisted.operations or {}
     service.events = persisted.events or {}
@@ -563,6 +569,9 @@ function Service:_update_runtime(command, changes)
   end
   if value.metadata ~= nil then runtime.metadata = copy(value.metadata) end
   self.runtimes[id] = runtime
+  if runtime.resource_id and self.resources[runtime.resource_id] and runtime.status then
+    self.resources[runtime.resource_id].status = runtime.status
+  end
   changes[#changes + 1] = {
     type = "runtime.updated",
     entity_type = "runtime",
@@ -679,10 +688,10 @@ function Service:execute(command)
     result, handler_message = self:_create_resource(command, changes)
   elseif command_type == "resource.update" or command_type == "resource.attach"
       or command_type == "resource.detach" or command_type == "terminal.update"
-      or command_type == "terminal.status" or command_type == "runtime.start"
-      or command_type == "runtime.stop" or command_type == "runtime.restart" then
+      or command_type == "terminal.status" then
     result, handler_message = self:_update_resource(command, changes)
-  elseif command_type == "runtime.update" then
+  elseif command_type == "runtime.update" or command_type == "runtime.start"
+      or command_type == "runtime.stop" or command_type == "runtime.restart" then
     result, handler_message = self:_update_runtime(command, changes)
   elseif command_type == "provider.metadata.update" then
     result, handler_message = self:_update_provider_metadata(command, changes)

@@ -36,8 +36,9 @@ workbench-agent --data-root /path/to/pragtical/data \
 
 The client selects it with `backend = "agent"` and the same `endpoint`.
 The current agent vertical slice supports SQLite-backed workspace commands,
-snapshots, event subscriptions, replay recovery, and reconnect. Persistent
-terminal ownership and Windows named-pipe transport remain later runtime work.
+snapshots, event subscriptions, replay recovery, reconnect, POSIX PTY ownership,
+bounded output queues, byte-offset history, input, resize, and terminal replay.
+ConPTY and Windows named-pipe transport remain later runtime work.
 
 When this repository is checked out as `data/plugins/workbench` inside
 Pragtical, the Lua files at its root are installed directly as the

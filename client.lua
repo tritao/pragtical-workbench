@@ -61,9 +61,19 @@ end
 
 function Client:_handle_agent_message(message)
   if message.kind == "event" and message.event then
-    if message.offset then self.agent_event_offset = message.offset + 1 end
-    for _, callback in ipairs(self.agent_callbacks or {}) do
-      pcall(callback, message.event)
+    local event = message.event
+    if (event.type == "output" or event.type == "status") and event.runtime_id then
+      local events = self.agent_runtime_events[event.runtime_id]
+      if not events then
+        events = {}
+        self.agent_runtime_events[event.runtime_id] = events
+      end
+      events[#events + 1] = event
+    else
+      if message.offset then self.agent_event_offset = message.offset + 1 end
+      for _, callback in ipairs(self.agent_callbacks or {}) do
+        pcall(callback, event)
+      end
     end
   elseif message.kind == "snapshot" and message.snapshot then
     self.agent_snapshot = message.snapshot
@@ -82,7 +92,7 @@ function Client:_agent_snapshot()
   return self.agent_snapshot
 end
 
-function Client:_agent_execute(command)
+function Client:_agent_execute(command, refresh_snapshot)
   local response, message = self:_agent_message(Protocol.request("command",
     next_id("workbench-request"), { command = command }), "result")
   if not response then
@@ -92,7 +102,13 @@ function Client:_agent_execute(command)
     return agent_error("agent_error", tostring(message))
   end
   local result = response.result or agent_error("invalid_response", "agent returned no result")
-  if result.code == "ok" then
+  for _, event in ipairs(result.runtime_events or {}) do
+    self:_handle_agent_message(Protocol.request("event", nil, {
+      event = event,
+      offset = event.offset,
+    }))
+  end
+  if result.code == "ok" and refresh_snapshot ~= false then
     local snapshot = self:_agent_snapshot()
     if not snapshot then
       return agent_error("agent_disconnected", "agent did not return a snapshot")
@@ -163,6 +179,7 @@ function Client.open(options)
       closed = false,
       agent_callbacks = {},
       agent_event_offset = 0,
+      agent_runtime_events = {},
     }, Client)
     local hello, message = client:_agent_message(Protocol.request("hello",
       next_id("workbench-hello"), {
@@ -279,13 +296,48 @@ function Client:write_runtime(runtime_id, data)
   if self.handle and self.handle.write_runtime then
     return self.handle:write_runtime(runtime_id, data)
   end
-  if self.connection then return false, "agent runtimes are not available yet" end
+  if self.connection then
+    local result = self:_agent_execute({
+      type = "runtime.input", runtime_id = runtime_id, data = data,
+    }, false)
+    return result.code == "ok", result
+  end
   return true
+end
+
+function Client:start_runtime(runtime_id, options)
+  if self.handle and self.handle.start_runtime then
+    return self.handle:start_runtime(runtime_id, options or {})
+  end
+  if not self.connection then return true end
+  options = options or {}
+  local result = self:_agent_execute {
+    type = "runtime.start",
+    runtime_id = runtime_id,
+    resource_id = runtime_id,
+    columns = options.columns,
+    rows = options.rows,
+    shell = options.shell,
+    command = options.command,
+    args = options.args,
+    cwd = options.cwd,
+    environment = options.environment,
+    term = options.term,
+    scrollback_limit = options.scrollback_limit,
+  }
+  return result.code == "ok", result
 end
 
 function Client:resize_runtime(runtime_id, columns, rows)
   if self.handle and self.handle.resize_runtime then
     return self.handle:resize_runtime(runtime_id, columns, rows)
+  end
+  if self.connection then
+    local result = self:_agent_execute({
+      type = "runtime.resize", runtime_id = runtime_id,
+      columns = columns, rows = rows,
+    }, false)
+    return result.code == "ok", result
   end
   local result = self:execute {
     type = "terminal.update",
@@ -301,6 +353,12 @@ function Client:stop_runtime(runtime_id, options)
   if self.handle and self.handle.stop_runtime then
     return self.handle:stop_runtime(runtime_id, options or {})
   end
+  if self.connection then
+    local result = self:_agent_execute({
+      type = "runtime.stop", runtime_id = runtime_id,
+    })
+    return result.code == "ok", result
+  end
   local result = self:execute {
     type = "terminal.status",
     operation_id = next_id("runtime-stop-" .. runtime_id),
@@ -314,7 +372,7 @@ function Client:detach_runtime(runtime_id)
   if self.handle and self.handle.detach_runtime then
     return self.handle:detach_runtime(runtime_id)
   end
-  if self.connection then return false, "agent runtimes are not available yet" end
+  if self.connection then return true end
   return true
 end
 
@@ -322,13 +380,25 @@ function Client:request_runtime_output(runtime_id, offset)
   if self.handle and self.handle.request_runtime_output then
     return self.handle:request_runtime_output(runtime_id, offset)
   end
-  if self.connection then return false, "agent runtime replay is not available yet" end
+  if self.connection then
+    local result = self:_agent_execute({
+      type = "runtime.replay", runtime_id = runtime_id, offset = offset or 0,
+    }, false)
+    if result.code ~= "ok" then return false, result end
+    return true, result
+  end
   return false, "runtime replay is not available"
 end
 
 function Client:poll_runtime_events(runtime_id)
   if self.handle and self.handle.poll_runtime_events then
     return self.handle:poll_runtime_events(runtime_id)
+  end
+  if self.connection then
+    self:poll()
+    local events = self.agent_runtime_events[runtime_id] or {}
+    self.agent_runtime_events[runtime_id] = {}
+    return events
   end
   return {}
 end
@@ -337,6 +407,14 @@ function Client:terminal_session(resource_id, options)
   local snapshot = self:snapshot()
   for _, resource in ipairs(snapshot.terminals or {}) do
     if resource.id == resource_id then
+      if self.connection then
+        local started, start_result = self:start_runtime(resource_id, options or {})
+        if not started then
+          return nil, start_result and (start_result.message or start_result.code)
+            or "unable to start Workbench runtime"
+        end
+        resource.status = "running"
+      end
       local WorkbenchSession = require "plugins.workbench.terminal_session"
       return WorkbenchSession(self, resource, options)
     end
