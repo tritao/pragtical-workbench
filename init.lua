@@ -3,6 +3,7 @@ local core = require "core"
 local command = require "core.command"
 local common = require "core.common"
 local config = require "core.config"
+local style = require "core.style"
 
 local Sidebar = require "plugins.workbench.sidebar"
 
@@ -40,6 +41,19 @@ local function prompt(label, submit)
   })
 end
 
+local function show_import_report(plan)
+  if #plan.errors > 0 then
+    core.error("Sakura import failed: %s", plan.errors[1])
+    return
+  end
+  local counts = plan.imported or plan.counts or {}
+  local message = string.format(
+    "Sakura import: %d collections, %d tasks, %d terminal resources",
+    counts.collections or 0, counts.tasks or 0, counts.resources or 0)
+  if plan.backup_path then message = message .. " (backup: " .. plan.backup_path .. ")" end
+  core.status_view:show_message("i", style.text, message)
+end
+
 command.add(nil, {
   ["workbench:open"] = function()
     open_view()
@@ -74,6 +88,30 @@ command.add(nil, {
   ["workbench:create-terminal"] = function()
     local view = get_view() or open_view()
     prompt("Terminal title", function(title) view:create_terminal(title) end)
+  end,
+
+  ["workbench:import-sakura"] = function()
+    local view = get_view() or open_view()
+    if not view.client then
+      core.error("Workbench client is unavailable")
+      return
+    end
+    prompt("Sakura session file", function(path)
+      local Importer = require "plugins.workbench.sakura_import"
+      local ok, plan, message = pcall(function()
+        return Importer.import_file(view.client, path)
+      end)
+      if not ok then
+        core.error("Sakura import failed: %s", plan)
+        return
+      end
+      if not plan then
+        core.error("Sakura import failed: %s", message or "unknown importer error")
+        return
+      end
+      show_import_report(plan)
+      if plan.valid then view:refresh() end
+    end)
   end
 })
 

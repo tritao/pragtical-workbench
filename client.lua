@@ -117,6 +117,25 @@ function Client:_agent_execute(command, refresh_snapshot)
   return result
 end
 
+function Client:_agent_execute_batch(commands)
+  local response, message = self:_agent_message(Protocol.request("batch",
+    next_id("workbench-batch"), { commands = commands }), "result")
+  if not response then
+    if type(message) == "table" then
+      return agent_error(message.code, message.message)
+    end
+    return agent_error("agent_error", tostring(message))
+  end
+  local result = response.result or agent_error("invalid_response", "agent returned no result")
+  if result.code == "ok" then
+    local snapshot = self:_agent_snapshot()
+    if not snapshot then
+      return agent_error("agent_disconnected", "agent did not return a snapshot")
+    end
+  end
+  return result
+end
+
 function Client.open(options)
   options = options or {}
   local backend = options.backend or "fake"
@@ -243,6 +262,41 @@ function Client:execute(command)
   if self.service then return self.service:execute(command) end
   if self.connection then return self:_agent_execute(command) end
   return self.handle:execute(command)
+end
+
+function Client:execute_batch(commands)
+  if self.closed then
+    return { code = "closed", message = "Workbench client is closed" }
+  end
+  if type(commands) ~= "table" or #commands == 0 then
+    return { code = "invalid_command", message = "command batch must not be empty" }
+  end
+
+  local prepared = {}
+  local revision = self:snapshot().revision
+  for index, command in ipairs(commands) do
+    local value = copy_command(self, command)
+    if command.expected_revision == nil then
+      value.expected_revision = revision + index - 1
+    end
+    prepared[#prepared + 1] = value
+  end
+  if self.service then return self.service:execute_batch(prepared) end
+  if self.connection then return self:_agent_execute_batch(prepared) end
+
+  local results = {}
+  for _, command in ipairs(prepared) do
+    local result = self.handle:execute(command)
+    results[#results + 1] = result
+    if result.code ~= "ok" then
+      return {
+        code = result.code,
+        message = result.message,
+        results = results,
+      }
+    end
+  end
+  return { code = "ok", revision = self:snapshot().revision, results = results }
 end
 
 function Client:on_event(callback)

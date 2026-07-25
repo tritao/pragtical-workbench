@@ -144,6 +144,10 @@ The in-process backend dispatches directly to the shared Lua service. The
 agent backend serializes the same command, result, and event table shapes.
 The UI must use the asynchronous contract even when the backend is local.
 
+For migrations, the client also exposes `execute_batch(commands)`. Importers
+use this to apply a validated command plan in one service/SQLite transaction;
+the agent carries the same batch as a MessagePack request.
+
 ## Lua-first domain model
 
 Views and providers must not mutate model tables directly. Every mutation goes
@@ -312,6 +316,21 @@ dry-run, leave the source unchanged, create a backup before database changes,
 report skipped fields, reject ambiguous references, produce deterministic
 output where possible, and validate the result through the new service.
 
+The first implementation is `data/plugins/workbench/sakura_import.lua`. It
+parses Sakura's GLib `GKeyFile` session format independently, converts groups,
+tasks, and terminal tabs to Workbench records, reports pages/layouts and
+unsupported provider metadata as skipped, and exposes:
+
+```lua
+Importer.preview(session_path)
+Importer.import_file(client, session_path)
+```
+
+The `workbench:import-sakura` command invokes the importer from Pragtical.
+Import is refused when the source is malformed, references are ambiguous, a
+target ID already exists, or the default backup path already exists. A dry run
+does not create the backup or modify the target workspace.
+
 ## Implementation phases
 
 ### Current status
@@ -370,8 +389,9 @@ in source; Windows CI and end-to-end validation remain.
 
 ### Phase 7 — Sakura importer
 
-Implement the independent importer after the new model and persistence layer
-are stable.
+The independent importer, dry-run report, source backup, command batch, SQLite
+transaction, validation, and Pragtical command are implemented. Remaining
+work is broader fixture coverage and migration UX polish.
 
 ### Phase 8 — Providers
 

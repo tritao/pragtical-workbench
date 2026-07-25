@@ -418,6 +418,18 @@ local function run_client(service, connection, options, runtimes, history_direct
           offset = service.event_offset + #service.events,
         }))
         if not ok then return nil, send_message end
+      elseif message.kind == "batch" then
+        if type(message.commands) ~= "table" then
+          send(connection, error_message(message.request_id, "invalid_command", "commands are required"))
+        else
+          local result = service:execute_batch(message.commands)
+          local ok, send_message = send(connection, Protocol.request("result", message.request_id, {
+            result = result,
+          }))
+          if not ok then return nil, send_message end
+          local flushed, flush_message = tick()
+          if not flushed then return nil, flush_message end
+        end
       elseif message.kind == "command" then
         if type(message.command) ~= "table" then
           send(connection, error_message(message.request_id, "invalid_command", "command is required"))

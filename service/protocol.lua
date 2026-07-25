@@ -9,6 +9,7 @@ local kinds = {
   hello = true,
   hello_result = true,
   command = true,
+  batch = true,
   result = true,
   snapshot = true,
   subscribe = true,
@@ -22,6 +23,7 @@ local required = {
   hello = { "request_id" },
   hello_result = { "request_id" },
   command = { "request_id", "command" },
+  batch = { "request_id", "commands" },
   result = { "request_id", "result" },
   snapshot = { "request_id" },
   subscribe = { "request_id" },
@@ -42,6 +44,9 @@ local function validate(message)
     if message[field] == nil then
       return nil, "missing required Workbench protocol field: " .. field
     end
+  end
+  if message.kind == "batch" and type(message.commands) ~= "table" then
+    return nil, "Workbench batch commands must be a table"
   end
   return true
 end

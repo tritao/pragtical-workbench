@@ -42,4 +42,17 @@ test.describe("Workbench protocol", function()
     test.equal(decoded, nil)
     test.ok(message:match("trailing"))
   end)
+
+  test.test("validates command batches", function()
+    local frame = Protocol.encode {
+      kind = "batch",
+      request_id = "batch-1",
+      commands = {
+        { type = "workspace.rename", name = "Imported" },
+      },
+    }
+    local decoded = assert(Protocol.decode(frame))
+    test.equal(decoded.kind, "batch")
+    test.equal(decoded.commands[1].type, "workspace.rename")
+  end)
 end)

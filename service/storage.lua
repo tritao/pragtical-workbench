@@ -262,8 +262,9 @@ local function save_provider_metadata(db, workspace_id, records)
 end
 
 function Storage:commit(service, operation_id, result, events)
+  local own_transaction = not self.in_transaction
   local ok, message = pcall(function()
-    self.db:execute("BEGIN")
+    if own_transaction then self.db:execute("BEGIN") end
     self.db:execute([[
       INSERT INTO workspaces(id, name, revision, sequence, event_offset)
         VALUES (?, ?, ?, ?, ?)
@@ -301,17 +302,36 @@ function Storage:commit(service, operation_id, result, events)
             WHERE workspace_id = ? ORDER BY event_id DESC LIMIT ?
          )
     ]], { service.workspace_id, service.workspace_id, event_limit })
-    self.db:execute("COMMIT")
+    if own_transaction then self.db:execute("COMMIT") end
   end)
   if not ok then
-    pcall(function() self.db:execute("ROLLBACK") end)
+    if own_transaction then pcall(function() self.db:execute("ROLLBACK") end) end
     return false, message
   end
   return true
 end
 
+function Storage:begin_transaction()
+  if self.in_transaction then return false, "storage transaction is already active" end
+  local ok, message = pcall(function() self.db:execute("BEGIN") end)
+  if not ok then return false, message end
+  self.in_transaction = true
+  return true
+end
+
+function Storage:end_transaction(commit)
+  if not self.in_transaction then return true end
+  local ok, message = pcall(function()
+    self.db:execute(commit and "COMMIT" or "ROLLBACK")
+  end)
+  self.in_transaction = false
+  if not ok then return false, message end
+  return true
+end
+
 function Storage:close()
   if self.db then
+    if self.in_transaction then self:end_transaction(false) end
     self.db:close()
     self.db = nil
   end

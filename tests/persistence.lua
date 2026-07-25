@@ -165,4 +165,62 @@ test.describe("Workbench SQLite persistence", function()
     test.equal(#service:snapshot().collections, 0)
     service:close()
   end)
+
+  test.test("commits and rolls back command batches atomically", function()
+    local path = os.tmpname()
+    os.remove(path)
+    local workspace_id = new_workspace_id()
+    local service = Service.new {
+      workspace_id = workspace_id,
+      store = assert(Storage.new(path)),
+    }
+    local committed = service:execute_batch {
+      {
+        type = "collection.create",
+        operation_id = "batch-persisted-collection",
+        expected_revision = 0,
+        id = "batch-persisted-collection",
+        title = "Batch collection",
+      },
+      {
+        type = "task.create",
+        operation_id = "batch-persisted-task",
+        expected_revision = 1,
+        id = "batch-persisted-task",
+        title = "Batch task",
+        collection_id = "batch-persisted-collection",
+      },
+    }
+    test.equal(committed.code, "ok")
+    test.equal(service:snapshot().revision, 2)
+    local rejected = service:execute_batch {
+      {
+        type = "collection.create",
+        operation_id = "batch-rolled-back-collection",
+        expected_revision = 2,
+        id = "batch-rolled-back-collection",
+        title = "Should roll back",
+      },
+      {
+        type = "task.create",
+        operation_id = "batch-rolled-back-task",
+        expected_revision = 3,
+        id = "batch-rolled-back-task",
+        title = "",
+      },
+    }
+    test.equal(rejected.code, "invalid_command")
+    test.equal(service:snapshot().revision, 2)
+    service:close()
+
+    local reopened = Service.new {
+      workspace_id = workspace_id,
+      store = assert(Storage.new(path)),
+    }
+    test.equal(reopened:snapshot().revision, 2)
+    test.equal(#reopened:snapshot().collections, 1)
+    test.equal(#reopened:snapshot().tasks, 1)
+    reopened:close()
+    os.remove(path)
+  end)
 end)

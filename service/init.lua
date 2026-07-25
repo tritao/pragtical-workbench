@@ -195,9 +195,15 @@ function Service:_commit(operation_id, changes, extra)
   end
   self.operations[operation_id] = copy(result)
 
-  for _, event in ipairs(emitted) do
-    for _, callback in pairs(self.listeners) do
-      callback(copy(event))
+  if self._batch then
+    for _, event in ipairs(emitted) do
+      self._batch.events[#self._batch.events + 1] = copy(event)
+    end
+  else
+    for _, event in ipairs(emitted) do
+      for _, callback in pairs(self.listeners) do
+        callback(copy(event))
+      end
     end
   end
   return result
@@ -713,6 +719,70 @@ function Service:execute(command)
     self:_restore(checkpoint)
   end
   return committed
+end
+
+function Service:execute_batch(commands)
+  if type(commands) ~= "table" or #commands == 0 then
+    return self:_error("invalid_command", "command batch must not be empty")
+  end
+
+  local checkpoint = self:_state()
+  local batch = { events = {}, results = {} }
+  self._batch = batch
+  if self.store and self.store.begin_transaction then
+    local started, message = self.store:begin_transaction()
+    if not started then
+      self._batch = nil
+      return self:_error("storage_error", message)
+    end
+  end
+
+  local failure
+  for _, command in ipairs(commands) do
+    local result = self:execute(command)
+    batch.results[#batch.results + 1] = result
+    if result.code ~= "ok" then
+      failure = result
+      break
+    end
+  end
+
+  if failure then
+    if self.store and self.store.end_transaction then
+      self.store:end_transaction(false)
+    end
+    self._batch = nil
+    self:_restore(checkpoint)
+    return {
+      code = failure.code,
+      message = failure.message,
+      operation_id = failure.operation_id,
+      revision = self.revision,
+      results = batch.results,
+    }
+  end
+
+  if self.store and self.store.end_transaction then
+    local committed, message = self.store:end_transaction(true)
+    if not committed then
+      self._batch = nil
+      self:_restore(checkpoint)
+      return self:_error("storage_error", message)
+    end
+  end
+
+  self._batch = nil
+  for _, event in ipairs(batch.events) do
+    for _, callback in pairs(self.listeners) do
+      callback(copy(event))
+    end
+  end
+  return {
+    code = "ok",
+    revision = self.revision,
+    results = batch.results,
+    events = batch.events,
+  }
 end
 
 return Service

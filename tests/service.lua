@@ -124,5 +124,29 @@ test.describe("Workbench Lua service", function()
     test.equal(updated.code, "ok")
     test.equal(service:snapshot().terminals[1].status, "running")
   end)
-end)
 
+  test.test("rolls back an invalid command batch and defers events", function()
+    local seen = {}
+    service:subscribe(function(event) seen[#seen + 1] = event end)
+    local result = service:execute_batch {
+      {
+        type = "collection.create",
+        operation_id = "batch-collection",
+        expected_revision = 0,
+        id = "batch-collection",
+        title = "Batch collection",
+      },
+      {
+        type = "task.create",
+        operation_id = "batch-invalid-task",
+        expected_revision = 1,
+        id = "batch-task",
+        title = "",
+      },
+    }
+    test.equal(result.code, "invalid_command")
+    test.equal(service:snapshot().revision, 0)
+    test.equal(#service:snapshot().collections, 0)
+    test.equal(#seen, 0)
+  end)
+end)
