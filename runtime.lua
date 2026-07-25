@@ -3,7 +3,8 @@ local Runtime = {}
 local active = {}
 
 function Runtime.key(client, terminal_id)
-  return client:backend() .. ":" .. client:workspace() .. ":" .. terminal_id
+  return tostring(client.backend or "unknown") .. ":"
+    .. tostring(client.workspace_id or "default") .. ":" .. terminal_id
 end
 
 function Runtime.get(client, terminal_id)
