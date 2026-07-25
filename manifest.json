@@ -1,0 +1,18 @@
+{
+  "addons": [
+    {
+      "id": "workbench",
+      "name": "Workbench",
+      "description": "Workspace, task, resource, and terminal workflows for Pragtical.",
+      "version": "0.1.0",
+      "mod_version": "3",
+      "path": "plugins/workbench",
+      "tags": [
+        "workspace",
+        "tasks",
+        "terminal"
+      ]
+    }
+  ]
+}
+
