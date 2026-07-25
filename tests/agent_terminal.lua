@@ -4,14 +4,14 @@ local Client = require "plugins.workbench.client"
 local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "", "WORKBENCH_AGENT_ENDPOINT is required")
 
-local function collect_output(session, seconds)
+local function collect_output(session, seconds, expected)
   local output = {}
   local deadline = system.get_time() + seconds
   while system.get_time() < deadline do
     for _, event in ipairs(session:poll_events()) do
       if event.type == "output" then output[#output + 1] = event.data end
     end
-    if #output > 0 then break end
+    if not expected or table.concat(output):find(expected, 1, true) then break end
     system.sleep(0.01)
   end
   return table.concat(output)
@@ -43,9 +43,9 @@ test.describe("Workbench agent terminal runtime", function()
     test.ok(session.capabilities.persistent)
     test.ok(session.capabilities.replay)
     test.ok(session:attach())
-    test.contains(collect_output(session, 2), "agent-terminal-output")
+    test.contains(collect_output(session, 2, "agent-terminal-output"), "agent-terminal-output")
     test.ok(session:write("agent-input\n"))
-    test.contains(collect_output(session, 2), "agent-input:agent-input")
+    test.contains(collect_output(session, 2, "agent-input:agent-input"), "agent-input:agent-input")
     test.ok(session:detach())
     first:close()
 
@@ -56,7 +56,7 @@ test.describe("Workbench agent terminal runtime", function()
     test.equal(second:snapshot().terminals[1].status, "running")
     local reattached = assert(second:terminal_session("agent-terminal"))
     test.ok(reattached:attach())
-    test.contains(collect_output(reattached, 2), "agent-terminal-output")
+    test.contains(collect_output(reattached, 2, "agent-terminal-output"), "agent-terminal-output")
     test.ok(reattached:resize(100, 30))
     test.ok(reattached:terminate())
     test.equal(reattached:status(), "closed")
