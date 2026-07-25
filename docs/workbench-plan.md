@@ -314,6 +314,14 @@ output where possible, and validate the result through the new service.
 
 ## Implementation phases
 
+### Current status
+
+The local persistence milestone is implemented. Workbench now has Lua-owned
+SQLite migrations, normalized current-state storage, runtime and provider
+metadata, idempotent operation records, bounded event replay with snapshot
+fallback boundaries, and a bundled SQLite fallback selected by Meson when a
+system SQLite dependency is unavailable.
+
 ### Phase 1 — Pure-Lua service
 
 Implement and test the workspace, collections, tasks, resources, command
@@ -406,4 +414,3 @@ Framed MessagePack IPC
 Optional JSON-RPC diagnostics
 One-off Sakura importer
 ```
-

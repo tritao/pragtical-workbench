@@ -7,6 +7,8 @@ local sqlite_available, sqlite = pcall(require, "sqlite")
 local Storage = {}
 Storage.__index = Storage
 
+local DEFAULT_EVENT_LIMIT = 4096
+
 local function bool(value)
   return value == true or value == 1
 end
@@ -90,18 +92,59 @@ local function load_operations(db, workspace_id)
   return records
 end
 
-local function load_events(db, workspace_id)
+local function load_events(db, workspace_id, limit)
   local events = {}
-  for _, row in ipairs(db:query([[
-    SELECT payload FROM events WHERE workspace_id = ? ORDER BY event_id
-  ]], { workspace_id })) do
+  local rows = db:query([[
+    SELECT payload FROM events WHERE workspace_id = ? ORDER BY event_id DESC
+      LIMIT ?
+  ]], { workspace_id, limit or DEFAULT_EVENT_LIMIT })
+  for index = #rows, 1, -1 do
+    local row = rows[index]
     local event = decode(row.payload)
     if event then events[#events + 1] = event end
   end
   return events
 end
 
-function Storage.new(path)
+local function load_runtimes(db, workspace_id)
+  local records = {}
+  for _, row in ipairs(db:query([[
+    SELECT id, resource_id, status, pid, started_at, ended_at,
+           output_bytes, output_offset, history_path, metadata
+      FROM runtimes WHERE workspace_id = ? ORDER BY id
+  ]], { workspace_id })) do
+    records[row.id] = {
+      id = row.id,
+      resource_id = row.resource_id,
+      status = row.status,
+      pid = row.pid,
+      started_at = row.started_at,
+      ended_at = row.ended_at,
+      output_bytes = row.output_bytes or 0,
+      output_offset = row.output_offset or 0,
+      history_path = row.history_path,
+      metadata = decode(row.metadata, {}),
+    }
+  end
+  return records
+end
+
+local function load_provider_metadata(db, workspace_id)
+  local records = {}
+  for _, row in ipairs(db:query([[
+    SELECT provider_id, metadata FROM provider_metadata
+      WHERE workspace_id = ? ORDER BY provider_id
+  ]], { workspace_id })) do
+    records[row.provider_id] = {
+      provider_id = row.provider_id,
+      metadata = decode(row.metadata, {}),
+    }
+  end
+  return records
+end
+
+function Storage.new(path, options)
+  options = options or {}
   if not sqlite_available then
     return nil, "SQLite support is unavailable: " .. tostring(sqlite)
   end
@@ -117,12 +160,17 @@ function Storage.new(path)
     db:close()
     return nil, message
   end
-  return setmetatable({ path = path, db = db }, Storage)
+  return setmetatable({
+    path = path,
+    db = db,
+    event_limit = options.event_limit or DEFAULT_EVENT_LIMIT,
+  }, Storage)
 end
 
 function Storage:load(workspace_id)
   local row = self.db:query([[
-    SELECT id, name, revision, sequence FROM workspaces WHERE id = ?
+    SELECT id, name, revision, sequence, event_offset
+      FROM workspaces WHERE id = ?
   ]], { workspace_id })[1]
   if not row then return nil end
   return {
@@ -130,11 +178,14 @@ function Storage:load(workspace_id)
     name = row.name,
     revision = row.revision,
     sequence = row.sequence,
+    event_offset = row.event_offset or 0,
     collections = load_collections(self.db, workspace_id),
     tasks = load_tasks(self.db, workspace_id),
     resources = load_resources(self.db, workspace_id),
+    runtimes = load_runtimes(self.db, workspace_id),
+    provider_metadata = load_provider_metadata(self.db, workspace_id),
     operations = load_operations(self.db, workspace_id),
-    events = load_events(self.db, workspace_id),
+    events = load_events(self.db, workspace_id, self.event_limit),
   }
 end
 
@@ -181,21 +232,55 @@ local function save_resources(db, workspace_id, records)
   end
 end
 
+local function save_runtimes(db, workspace_id, records)
+  db:execute("DELETE FROM runtimes WHERE workspace_id = ?", { workspace_id })
+  for _, record in pairs(records) do
+    db:execute([[
+      INSERT INTO runtimes(
+        id, workspace_id, resource_id, status, pid, started_at, ended_at,
+        output_bytes, output_offset, history_path, metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ]], {
+      record.id, workspace_id, record.resource_id, record.status, record.pid,
+      record.started_at, record.ended_at, record.output_bytes or 0,
+      record.output_offset or 0, record.history_path,
+      Codec.encode(record.metadata or {}),
+    })
+  end
+end
+
+local function save_provider_metadata(db, workspace_id, records)
+  db:execute("DELETE FROM provider_metadata WHERE workspace_id = ?", { workspace_id })
+  for _, record in pairs(records) do
+    db:execute([[
+      INSERT INTO provider_metadata(workspace_id, provider_id, metadata)
+      VALUES (?, ?, ?)
+    ]], {
+      workspace_id, record.provider_id, Codec.encode(record.metadata or {})
+    })
+  end
+end
+
 function Storage:commit(service, operation_id, result, events)
   local ok, message = pcall(function()
     self.db:execute("BEGIN")
     self.db:execute([[
-      INSERT INTO workspaces(id, name, revision, sequence) VALUES (?, ?, ?, ?)
+      INSERT INTO workspaces(id, name, revision, sequence, event_offset)
+        VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         revision = excluded.revision,
-        sequence = excluded.sequence
+        sequence = excluded.sequence,
+        event_offset = excluded.event_offset
     ]], {
-      service.workspace_id, service.name, service.revision, service.sequence
+      service.workspace_id, service.name, service.revision, service.sequence,
+      service.event_offset or 0,
     })
     save_collections(self.db, service.workspace_id, service.collections)
     save_tasks(self.db, service.workspace_id, service.tasks)
     save_resources(self.db, service.workspace_id, service.resources)
+    save_runtimes(self.db, service.workspace_id, service.runtimes)
+    save_provider_metadata(self.db, service.workspace_id, service.provider_metadata)
     self.db:execute([[
       INSERT OR REPLACE INTO operations(operation_id, workspace_id, revision, result)
       VALUES (?, ?, ?, ?)
@@ -207,6 +292,15 @@ function Storage:commit(service, operation_id, result, events)
         INSERT INTO events(workspace_id, revision, payload) VALUES (?, ?, ?)
       ]], { service.workspace_id, service.revision, Codec.encode(event) })
     end
+    local event_limit = service.event_limit or self.event_limit
+    self.db:execute([[
+      DELETE FROM events
+       WHERE workspace_id = ?
+         AND event_id NOT IN (
+           SELECT event_id FROM events
+            WHERE workspace_id = ? ORDER BY event_id DESC LIMIT ?
+         )
+    ]], { service.workspace_id, service.workspace_id, event_limit })
     self.db:execute("COMMIT")
   end)
   if not ok then

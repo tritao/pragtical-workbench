@@ -3,6 +3,8 @@ local validation = require "plugins.workbench.service.validation"
 local Service = {}
 Service.__index = Service
 
+local DEFAULT_EVENT_LIMIT = 4096
+
 local function copy(value, seen)
   if type(value) ~= "table" then return value end
   seen = seen or {}
@@ -54,6 +56,7 @@ function Service.new(options)
   options = options or {}
   local workspace_id = options.workspace_id or options.workspace or "default"
   local persisted = options.store and options.store:load(workspace_id)
+  local event_limit = options.event_limit or DEFAULT_EVENT_LIMIT
   local service = setmetatable({
     workspace_id = workspace_id,
     name = options.name or workspace_id,
@@ -62,9 +65,13 @@ function Service.new(options)
     collections = {},
     tasks = {},
     resources = {},
+    runtimes = {},
+    provider_metadata = {},
     operations = {},
     listeners = {},
     events = {},
+    event_offset = 0,
+    event_limit = event_limit,
     store = options.store,
   }, Service)
   if persisted then
@@ -74,8 +81,15 @@ function Service.new(options)
     service.collections = persisted.collections or {}
     service.tasks = persisted.tasks or {}
     service.resources = persisted.resources or {}
+    service.runtimes = persisted.runtimes or {}
+    service.provider_metadata = persisted.provider_metadata or {}
     service.operations = persisted.operations or {}
     service.events = persisted.events or {}
+    service.event_offset = persisted.event_offset or 0
+  end
+  while #service.events > service.event_limit do
+    table.remove(service.events, 1)
+    service.event_offset = service.event_offset + 1
   end
   return service
 end
@@ -120,8 +134,11 @@ function Service:_state()
     collections = copy(self.collections),
     tasks = copy(self.tasks),
     resources = copy(self.resources),
+    runtimes = copy(self.runtimes),
+    provider_metadata = copy(self.provider_metadata),
     operations = copy(self.operations),
     events = copy(self.events),
+    event_offset = self.event_offset,
   }
 end
 
@@ -132,8 +149,11 @@ function Service:_restore(state)
   self.collections = state.collections
   self.tasks = state.tasks
   self.resources = state.resources
+  self.runtimes = state.runtimes
+  self.provider_metadata = state.provider_metadata
   self.operations = state.operations
   self.events = state.events
+  self.event_offset = state.event_offset
 end
 
 function Service:_commit(operation_id, changes, extra)
@@ -144,6 +164,10 @@ function Service:_commit(operation_id, changes, extra)
     event.workspace_id = self.workspace_id
     self.events[#self.events + 1] = copy(event)
     emitted[#emitted + 1] = event
+  end
+  while #self.events > self.event_limit do
+    table.remove(self.events, 1)
+    self.event_offset = self.event_offset + 1
   end
 
   local result = merge({
@@ -201,14 +225,25 @@ function Service:snapshot()
     tasks = sorted_records(self.tasks),
     resources = resources,
     terminals = terminals,
+    runtimes = sorted_records(self.runtimes),
+    provider_metadata = sorted_records(self.provider_metadata),
+    event_offset = self.event_offset,
   }
 end
 
 function Service:get_events(offset)
   offset = offset or 0
+  if offset < self.event_offset then
+    return nil, {
+      code = "snapshot_required",
+      oldest_offset = self.event_offset,
+      revision = self.revision,
+    }
+  end
   local result = {}
-  for index = offset + 1, #self.events do
-    result[#result + 1] = copy(self.events[index])
+  local index = offset - self.event_offset + 1
+  for current = index, #self.events do
+    result[#result + 1] = copy(self.events[current])
   end
   return result
 end
@@ -494,6 +529,65 @@ function Service:_update_resource(command, changes)
   return {entity_id = id}
 end
 
+function Service:_update_runtime(command, changes)
+  local value = payload(command, "runtime")
+  local id = value.runtime_id or value.id
+  local ok, message = valid_field(validation.id, id, "runtime.id")
+  if not ok then return nil, message end
+
+  local runtime = self.runtimes[id] or { id = id, metadata = {} }
+  if value.resource_id ~= nil then
+    if not self.resources[value.resource_id] then
+      return nil, "resource not found: " .. tostring(value.resource_id)
+    end
+    runtime.resource_id = value.resource_id
+  end
+
+  for _, field in ipairs {
+    "status", "started_at", "ended_at", "history_path"
+  } do
+    if value[field] ~= nil then runtime[field] = value[field] end
+  end
+  for _, field in ipairs {
+    "pid", "output_bytes", "output_offset"
+  } do
+    if value[field] ~= nil then
+      ok, message = valid_field(validation.integer, value[field], "runtime." .. field)
+      if not ok then return nil, message end
+      runtime[field] = value[field]
+    end
+  end
+  if value.metadata ~= nil then runtime.metadata = copy(value.metadata) end
+  self.runtimes[id] = runtime
+  changes[#changes + 1] = {
+    type = "runtime.updated",
+    entity_type = "runtime",
+    entity_id = id,
+    resource_id = runtime.resource_id,
+    status = runtime.status,
+    output_offset = runtime.output_offset,
+  }
+  return {runtime_id = id}
+end
+
+function Service:_update_provider_metadata(command, changes)
+  local value = payload(command, "provider")
+  local id = value.provider_id or value.id
+  local ok, message = valid_field(validation.id, id, "provider.id")
+  if not ok then return nil, message end
+  if value.metadata == nil then return nil, "provider metadata is required" end
+  self.provider_metadata[id] = {
+    provider_id = id,
+    metadata = copy(value.metadata),
+  }
+  changes[#changes + 1] = {
+    type = "provider.metadata_updated",
+    entity_type = "provider",
+    entity_id = id,
+  }
+  return {provider_id = id}
+end
+
 function Service:_archive_resource(command, changes)
   local id = command.resource_id or command.terminal_id or command.id
   local resource, error_result = self:_require_record(self.resources, id, "resource")
@@ -584,6 +678,10 @@ function Service:execute(command)
       or command_type == "terminal.status" or command_type == "runtime.start"
       or command_type == "runtime.stop" or command_type == "runtime.restart" then
     result, handler_message = self:_update_resource(command, changes)
+  elseif command_type == "runtime.update" then
+    result, handler_message = self:_update_runtime(command, changes)
+  elseif command_type == "provider.metadata.update" then
+    result, handler_message = self:_update_provider_metadata(command, changes)
   elseif command_type == "resource.archive" then
     result, handler_message = self:_archive_resource(command, changes)
   elseif command_type == "resource.delete" or command_type == "terminal.delete"

@@ -44,12 +44,15 @@ function Client.open(options)
     if not entry then
       local store, message
       if storage_path then
-        store, message = Storage.new(storage_path)
+        store, message = Storage.new(storage_path, {
+          event_limit = options.event_limit,
+        })
         if not store then return nil, message end
       end
       local ok, service = pcall(Service.new, {
         workspace_id = workspace_id,
         store = store,
+        event_limit = options.event_limit,
       })
       if not ok then
         if store then store:close() end
@@ -65,6 +68,7 @@ function Client.open(options)
       backend = backend,
       workspace_id = workspace_id,
       storage_path = storage_path,
+      event_limit = options.event_limit,
       closed = false,
     }, Client)
   end

@@ -1,5 +1,6 @@
 local migrations = {
-  require "plugins.workbench.service.migration.001_initial"
+  require "plugins.workbench.service.migration.001_initial",
+  require "plugins.workbench.service.migration.002_runtime_metadata",
 }
 
 local Migration = {}
