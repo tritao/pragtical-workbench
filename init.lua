@@ -7,8 +7,9 @@ local config = require "core.config"
 local Sidebar = require "plugins.workbench.sidebar"
 
 config.plugins.workbench = common.merge({
-  backend = "fake",
+  backend = "in_process",
   workspace = "default",
+  storage_path = nil,
   size = 240 * SCALE
 }, config.plugins.workbench)
 

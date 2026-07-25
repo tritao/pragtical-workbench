@@ -52,9 +52,11 @@ end
 
 function Service.new(options)
   options = options or {}
-  return setmetatable({
-    workspace_id = options.workspace_id or options.workspace or "default",
-    name = options.name or options.workspace_id or options.workspace or "default",
+  local workspace_id = options.workspace_id or options.workspace or "default"
+  local persisted = options.store and options.store:load(workspace_id)
+  local service = setmetatable({
+    workspace_id = workspace_id,
+    name = options.name or workspace_id,
     revision = 0,
     sequence = 0,
     collections = {},
@@ -63,7 +65,19 @@ function Service.new(options)
     operations = {},
     listeners = {},
     events = {},
+    store = options.store,
   }, Service)
+  if persisted then
+    service.name = persisted.name or service.name
+    service.revision = persisted.revision or 0
+    service.sequence = persisted.sequence or 0
+    service.collections = persisted.collections or {}
+    service.tasks = persisted.tasks or {}
+    service.resources = persisted.resources or {}
+    service.operations = persisted.operations or {}
+    service.events = persisted.events or {}
+  end
+  return service
 end
 
 function Service:_next_id(prefix)
@@ -98,6 +112,30 @@ function Service:_next_order(records, parent_key, parent_field)
   return maximum + 1
 end
 
+function Service:_state()
+  return {
+    name = self.name,
+    revision = self.revision,
+    sequence = self.sequence,
+    collections = copy(self.collections),
+    tasks = copy(self.tasks),
+    resources = copy(self.resources),
+    operations = copy(self.operations),
+    events = copy(self.events),
+  }
+end
+
+function Service:_restore(state)
+  self.name = state.name
+  self.revision = state.revision
+  self.sequence = state.sequence
+  self.collections = state.collections
+  self.tasks = state.tasks
+  self.resources = state.resources
+  self.operations = state.operations
+  self.events = state.events
+end
+
 function Service:_commit(operation_id, changes, extra)
   self.revision = self.revision + 1
   local emitted = {}
@@ -114,6 +152,13 @@ function Service:_commit(operation_id, changes, extra)
     revision = self.revision,
     events = emitted,
   }, extra)
+
+  if self.store then
+    local ok, message = self.store:commit(self, operation_id, result, emitted)
+    if not ok then
+      return self:_error("storage_error", message, operation_id)
+    end
+  end
   self.operations[operation_id] = copy(result)
 
   for _, event in ipairs(emitted) do
@@ -170,6 +215,13 @@ end
 
 function Service:poll()
   return {}
+end
+
+function Service:close()
+  if self.store then
+    self.store:close()
+    self.store = nil
+  end
 end
 
 function Service:_create_collection(command, changes)
@@ -502,6 +554,7 @@ function Service:execute(command)
       .. ", current revision is " .. tostring(self.revision), operation_id)
   end
 
+  local checkpoint = self.store and self:_state()
   local changes = {}
   local result, handler_message
   local command_type = command.type
@@ -544,8 +597,11 @@ function Service:execute(command)
   if not result then
     return self:_error("invalid_command", handler_message, operation_id)
   end
-  return self:_commit(operation_id, changes, result)
+  local committed = self:_commit(operation_id, changes, result)
+  if committed.code == "storage_error" and checkpoint then
+    self:_restore(checkpoint)
+  end
+  return committed
 end
 
 return Service
-

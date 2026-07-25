@@ -37,7 +37,8 @@ function Sidebar:new(options)
 
   self.client, self.error = Client.open {
     backend = options.backend or config.plugins.workbench.backend,
-    workspace = options.workspace_id or config.plugins.workbench.workspace
+    workspace = options.workspace_id or config.plugins.workbench.workspace,
+    storage_path = options.storage_path or config.plugins.workbench.storage_path
   }
   local snapshot = empty_snapshot(options.workspace_id or config.plugins.workbench.workspace)
   if self.client then
@@ -65,6 +66,8 @@ function Sidebar:get_state()
     backend = self.client and self.client.backend
       or config.plugins.workbench.backend,
     workspace_id = self.model.workspace_id,
+    storage_path = self.client and self.client.storage_path
+      or config.plugins.workbench.storage_path,
     selected_id = self.selected_id,
     expanded = self.model.expanded
   }

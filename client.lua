@@ -1,5 +1,6 @@
 local native_available, native = pcall(require, "workbench")
 local Service = require "plugins.workbench.service"
+local Storage = require "plugins.workbench.service.storage"
 
 local next_operation = 0
 local services = {}
@@ -10,6 +11,11 @@ Client.__index = Client
 local function next_id(prefix)
   next_operation = next_operation + 1
   return prefix .. "-" .. tostring(next_operation)
+end
+
+local function default_storage_path()
+  if type(USERDIR) ~= "string" then return nil end
+  return USERDIR .. PATHSEP .. "workbench.sqlite3"
 end
 
 local function copy_command(client, command)
@@ -29,15 +35,36 @@ function Client.open(options)
   local workspace_id = options.workspace_id or options.workspace or "default"
 
   if backend == "fake" or backend == "in_process" then
-    local service = services[workspace_id]
-    if not service then
-      service = Service.new { workspace_id = workspace_id }
-      services[workspace_id] = service
+    local storage_path = options.storage_path
+    if backend == "in_process" and storage_path == nil then
+      storage_path = default_storage_path()
     end
+    local key = workspace_id .. "\0" .. tostring(storage_path or "memory")
+    local entry = services[key]
+    if not entry then
+      local store, message
+      if storage_path then
+        store, message = Storage.new(storage_path)
+        if not store then return nil, message end
+      end
+      local ok, service = pcall(Service.new, {
+        workspace_id = workspace_id,
+        store = store,
+      })
+      if not ok then
+        if store then store:close() end
+        return nil, service
+      end
+      entry = { service = service, clients = 0, key = key }
+      services[key] = entry
+    end
+    entry.clients = entry.clients + 1
     return setmetatable({
-      service = service,
+      service = entry.service,
+      service_entry = entry,
       backend = backend,
       workspace_id = workspace_id,
+      storage_path = storage_path,
       closed = false,
     }, Client)
   end
@@ -160,6 +187,14 @@ function Client:close()
   if self.handle then
     self.handle:close()
     self.handle = nil
+  end
+  if self.service_entry then
+    self.service_entry.clients = self.service_entry.clients - 1
+    if self.service_entry.clients <= 0 then
+      self.service_entry.service:close()
+      services[self.service_entry.key] = nil
+    end
+    self.service_entry = nil
   end
   self.closed = true
 end
