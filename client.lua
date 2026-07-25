@@ -76,6 +76,9 @@ function Client:_agent_snapshot()
     next_id("workbench-snapshot"), {}), "snapshot")
   if not response then return nil, message end
   self:_handle_agent_message(response)
+  if not self.agent_snapshot then
+    return nil, agent_error("snapshot_missing", "agent snapshot response was missing its snapshot field")
+  end
   return self.agent_snapshot
 end
 
@@ -177,7 +180,10 @@ function Client.open(options)
     client.agent_snapshot, message = client:_agent_snapshot()
     if not client.agent_snapshot then
       connection:close()
-      return nil, message and message.message or "Workbench agent did not return a snapshot"
+      if type(message) == "table" then
+        return nil, message.message or "Workbench agent did not return a snapshot"
+      end
+      return nil, message and tostring(message) or "Workbench agent did not return a snapshot"
     end
     return client
   end
