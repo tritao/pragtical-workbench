@@ -329,7 +329,8 @@ commands, snapshots, subscriptions, replay recovery, and SQLite-backed
 reconnect. The agent now also owns POSIX PTYs, persists raw output history,
 streams bounded output events, accepts input and resize commands, and serves
 byte-offset replay after client reconnect. ConPTY and Windows named-pipe
-transport remain to be completed.
+transport support are now implemented in the native boundary; Windows CI
+verification remains.
 
 ### Phase 1 — Pure-Lua service
 
@@ -351,8 +352,8 @@ domain mutation still flows through commands.
 
 Implement POSIX PTY support, a mock PTY, terminal emulation, event queues,
 `TerminalView`, start/stop/detach/reattach, resize, and large-output handling.
-The POSIX PTY and in-process path are implemented; add ConPTY after POSIX is
-stable.
+The POSIX PTY and in-process path are implemented, and the agent now exposes
+the shared runtime on Windows as well; Windows CI and runtime validation remain.
 
 ### Phase 5 — SQLite persistence
 
@@ -364,7 +365,8 @@ commands, operation history, bounded event journal, and runtime metadata.
 Add the embedded-Lua daemon, IPC transport, MessagePack schemas, handshake,
 capabilities, subscriptions, reconnect, snapshot recovery, and terminal offset
 replay. The embedded agent, Unix transport, POSIX runtime ownership, history,
-input, resize, and replay are implemented; ConPTY and Windows transport remain.
+input, resize, replay, ConPTY, and Windows named-pipe transport are implemented
+in source; Windows CI and end-to-end validation remain.
 
 ### Phase 7 — Sakura importer
 
