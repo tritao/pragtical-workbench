@@ -15,13 +15,29 @@ available.
 
 ```text
 data/plugins/workbench/  # Installed Pragtical plugin files in this repository
-service/                 # UI-independent shared Lua service (planned)
-agent/                   # Optional persistent agent (planned)
-native/                  # Optional native runtime bindings (planned)
-tests/                   # Service and protocol tests (planned)
-fixtures/                # Migration and protocol fixtures (planned)
+service/                 # UI-independent shared Lua service
+agent.lua                # Optional persistent agent server
+tests/                   # Service, protocol, and agent integration tests
 docs/                    # Architecture and implementation plans
+
+src/api/workbench_transport.c
+src/workbench-agent/main.c
 ```
+
+The in-process backend is selected with `backend = "in_process"`. The
+persistent POSIX agent can be started with:
+
+```text
+workbench-agent --data-root /path/to/pragtical/data \
+  --data-dir /path/to/workbench-state \
+  --endpoint /path/to/workbench-state/workbench.sock \
+  --workspace default
+```
+
+The client selects it with `backend = "agent"` and the same `endpoint`.
+The current agent vertical slice supports SQLite-backed workspace commands,
+snapshots, event subscriptions, replay recovery, and reconnect. Persistent
+terminal ownership and Windows named-pipe transport remain later runtime work.
 
 When this repository is checked out as `data/plugins/workbench` inside
 Pragtical, the Lua files at its root are installed directly as the
@@ -29,4 +45,3 @@ Pragtical, the Lua files at its root are installed directly as the
 
 See [docs/workbench-plan.md](docs/workbench-plan.md) for the architecture,
 milestones, and acceptance criteria.
-

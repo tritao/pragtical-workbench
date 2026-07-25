@@ -169,6 +169,10 @@ function Service:_commit(operation_id, changes, extra)
     table.remove(self.events, 1)
     self.event_offset = self.event_offset + 1
   end
+  local first_event_offset = self.event_offset + #self.events - #emitted
+  for index, event in ipairs(emitted) do
+    event.offset = first_event_offset + index - 1
+  end
 
   local result = merge({
     code = "ok",

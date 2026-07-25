@@ -322,6 +322,13 @@ metadata, idempotent operation records, bounded event replay with snapshot
 fallback boundaries, and a bundled SQLite fallback selected by Meson when a
 system SQLite dependency is unavailable.
 
+The agent vertical slice is now implemented on POSIX: a small embedded-Lua
+`workbench-agent` executable loads the same service, uses the shared framed
+MessagePack protocol over a Unix socket, and supports handshake/capabilities,
+commands, snapshots, subscriptions, replay recovery, and SQLite-backed
+reconnect. Terminal process ownership, terminal output streaming, and Windows
+named-pipe transport remain to be completed.
+
 ### Phase 1 — Pure-Lua service
 
 Implement and test the workspace, collections, tasks, resources, command
