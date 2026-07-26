@@ -15,7 +15,7 @@ end
 
 function WorkbenchTerminalView:new(options)
   options = options or {}
-  TerminalView.super.new(self, options.terminal_options or {})
+  TerminalView.new(self, options.terminal_options or {})
   self.client = assert(options.client, "Workbench terminal client is required")
   self.resource = options.resource or {}
   self.terminal_id = assert(options.terminal_id or self.resource.id,
