@@ -24,12 +24,26 @@ end
 
 function Sidebar:__tostring() return "Workbench" end
 
+function Sidebar:try_close(do_close)
+  do_close()
+  for index = #Sidebar.instances, 1, -1 do
+    if Sidebar.instances[index] == self then
+      table.remove(Sidebar.instances, index)
+    end
+  end
+  if Sidebar.instance == self then
+    Sidebar.instance = nil
+  end
+end
+
 function Sidebar:new(options)
   options = options or {}
   Sidebar.super.new(self)
   self.name = "Workbench"
   self.type_name = "plugins.workbench.sidebar"
   self.scrollable = true
+  self.visible = true
+  self.init_size = true
   self.target_size = options.size or config.plugins.workbench.size
   self.selected_id = options.selected_id
   self.hovered_index = nil
@@ -82,6 +96,10 @@ function Sidebar:set_target_size(axis, value)
     self.target_size = value
     return true
   end
+end
+
+function Sidebar:on_scale_change(new_scale, prev_scale)
+  self.target_size = self.target_size / prev_scale * new_scale
 end
 
 function Sidebar:on_event(event)
@@ -248,6 +266,18 @@ end
 
 function Sidebar:update()
   local processed = Sidebar.super.update(self)
+
+  local dest = self.visible and common.round(self.target_size) or 0
+  if self.init_size then
+    self.size.x = dest
+    self.init_size = false
+  elseif self.size.x ~= dest then
+    self:move_towards(self.size, "x", dest, nil, "workbench")
+    -- Round to keep the neighbouring pane pixel-aligned while resizing.
+    self.size.x = common.round(self.size.x)
+    if math.abs(dest - self.size.x) < 2 then self.size.x = dest end
+  end
+
   if self.client then
     local ok, result = pcall(function() return self.client:poll() end)
     if not ok then

@@ -15,21 +15,29 @@ config.plugins.workbench = common.merge({
 }, config.plugins.workbench)
 
 local function get_view()
-  return Sidebar.instance
+  local view = Sidebar.instance
+  if not view then return nil end
+  local root_node = core.root_view and core.root_view.root_node
+  if root_node and root_node:get_node_for_view(view) then
+    return view
+  end
+  if Sidebar.instance == view then
+    Sidebar.instance = nil
+  end
+  return nil
 end
 
 local function open_view()
   local view = get_view()
-  if view then
-    view.visible = true
-    core.set_active_view(view)
-    return view
+  if not view then
+    view = Sidebar()
+    local node = core.root_view:get_active_node_default()
+    view.node = node:split("left", view, { x = true }, true)
   end
 
-  view = Sidebar()
-  local node = core.root_view:get_active_node_default()
-  view.node = node:split("left", view, { x = true }, true)
+  view.visible = true
   core.set_active_view(view)
+  core.redraw = true
   return view
 end
 
