@@ -19,7 +19,23 @@ end
 
 test.describe("Workbench agent terminal runtime", function()
   test.test("keeps a PTY alive across client reconnect and replays history", function()
-    test.skip_if(PLATFORM == "Windows", "POSIX PTY launch is required")
+    local shell, args, input
+    if PLATFORM == "Windows" then
+      shell = "cmd.exe"
+      args = {
+        "/V:ON", "/S", "/C",
+        "echo agent-terminal-output & set /p line= & "
+          .. "echo agent-input:!line! & timeout /t 10 /nobreak >NUL",
+      }
+      input = "agent-input\r\n"
+    else
+      shell = "/bin/sh"
+      args = {
+        "-c",
+        "printf agent-terminal-output; read line; printf agent-input:$line; sleep 10",
+      }
+      input = "agent-input\n"
+    end
 
     local first = assert(Client.open {
       backend = "agent", endpoint = endpoint,
@@ -33,8 +49,8 @@ test.describe("Workbench agent terminal runtime", function()
       rows = 24,
       status = "starting",
       config = {
-        shell = "/bin/sh",
-        args = { "-c", "printf agent-terminal-output; read line; printf agent-input:$line; sleep 10" },
+        shell = shell,
+        args = args,
       },
     }
     test.equal(created.code, "ok")
@@ -44,7 +60,7 @@ test.describe("Workbench agent terminal runtime", function()
     test.ok(session.capabilities.replay)
     test.ok(session:attach())
     test.contains(collect_output(session, 2, "agent-terminal-output"), "agent-terminal-output")
-    test.ok(session:write("agent-input\n"))
+    test.ok(session:write(input))
     test.contains(collect_output(session, 2, "agent-input:agent-input"), "agent-input:agent-input")
     test.ok(session:detach())
     first:close()

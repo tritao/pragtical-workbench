@@ -39,7 +39,8 @@ The current agent vertical slice supports SQLite-backed workspace commands,
 snapshots, event subscriptions, replay recovery, reconnect, POSIX PTY ownership,
 bounded output queues, byte-offset history, input, resize, and terminal replay.
 ConPTY and Windows named-pipe transport support are now implemented in the
-native boundary; Windows CI remains the verification gate.
+native boundary; the Windows CI job now exercises the built agent, named-pipe
+transport, ConPTY terminal lifecycle, persistence, and reconnect paths.
 
 When this repository is checked out as `data/plugins/workbench` inside
 Pragtical, the Lua files at its root are installed directly as the
