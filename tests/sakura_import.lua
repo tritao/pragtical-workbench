@@ -78,6 +78,18 @@ local function workspace_id()
 end
 
 test.describe("Sakura Workbench importer", function()
+  test.test("loads a real-world Sakura v8 session fixture", function()
+    local source, message = Importer.load(
+      "data/plugins/workbench/tests/fixtures/sakura-session-v8.conf")
+    test.ok(source, message)
+    local plan = Importer.convert(source)
+    test.ok(plan.valid, table.concat(plan.errors, "\n"))
+    test.equal(plan.counts.collections, 19)
+    test.equal(plan.counts.tasks, 3)
+    test.equal(plan.counts.resources, 4)
+    test.ok(#plan.skipped > 0)
+  end)
+
   test.test("parses and converts the persisted Sakura records", function()
     local source = assert(Importer.parse(session_data()))
     test.equal(source.workspace_id, "legacy-workspace")

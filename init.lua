@@ -54,6 +54,20 @@ local function show_import_report(plan)
   core.status_view:show_message("i", style.text, message)
 end
 
+local function show_import_preview(plan)
+  local counts = plan.counts or {}
+  local message = string.format(
+    "Sakura preview: %d collections, %d tasks, %d terminal resources",
+    counts.collections or 0, counts.tasks or 0, counts.resources or 0)
+  if #plan.warnings > 0 then
+    message = message .. string.format("; %d warnings", #plan.warnings)
+  end
+  if #plan.skipped > 0 then
+    message = message .. string.format("; %d skipped fields", #plan.skipped)
+  end
+  core.status_view:show_message("i", style.text, message)
+end
+
 command.add(nil, {
   ["workbench:open"] = function()
     open_view()
@@ -99,7 +113,7 @@ command.add(nil, {
     prompt("Sakura session file", function(path)
       local Importer = require "plugins.workbench.sakura_import"
       local ok, plan, message = pcall(function()
-        return Importer.import_file(view.client, path)
+        return Importer.preview(path)
       end)
       if not ok then
         core.error("Sakura import failed: %s", plan)
@@ -109,8 +123,30 @@ command.add(nil, {
         core.error("Sakura import failed: %s", message or "unknown importer error")
         return
       end
-      show_import_report(plan)
-      if plan.valid then view:refresh() end
+      if not plan.valid then
+        show_import_report(plan)
+        return
+      end
+      show_import_preview(plan)
+      prompt("Type import to confirm Sakura migration", function(answer)
+        if answer:lower() ~= "import" then
+          core.status_view:show_message("i", style.text, "Sakura import canceled")
+          return
+        end
+        local import_ok, result, import_message = pcall(function()
+          return Importer.import_file(view.client, path)
+        end)
+        if not import_ok then
+          core.error("Sakura import failed: %s", result)
+          return
+        end
+        if not result then
+          core.error("Sakura import failed: %s", import_message or "unknown importer error")
+          return
+        end
+        show_import_report(result)
+        if result.valid then view:refresh() end
+      end)
     end)
   end
 })

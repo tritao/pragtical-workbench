@@ -326,10 +326,12 @@ Importer.preview(session_path)
 Importer.import_file(client, session_path)
 ```
 
-The `workbench:import-sakura` command invokes the importer from Pragtical.
-Import is refused when the source is malformed, references are ambiguous, a
-target ID already exists, or the default backup path already exists. A dry run
-does not create the backup or modify the target workspace.
+The `workbench:import-sakura` command previews the import counts, warnings, and
+skipped fields, then requires the user to type `import` before writing. Import
+is refused when the source is malformed, references are ambiguous, a target ID
+already exists, or the default backup path already exists. A dry run does not
+create the backup or modify the target workspace. A sanitized real-world v8
+session is checked in at `tests/fixtures/sakura-session-v8.conf`.
 
 ## Implementation phases
 
@@ -390,8 +392,9 @@ in source; Windows CI and end-to-end validation remain.
 ### Phase 7 — Sakura importer
 
 The independent importer, dry-run report, source backup, command batch, SQLite
-transaction, validation, and Pragtical command are implemented. Remaining
-work is broader fixture coverage and migration UX polish.
+transaction, validation, confirmation UX, and Pragtical command are
+implemented. Remaining work is broader fixture coverage and migration UX
+polish.
 
 ### Phase 8 — Providers
 
