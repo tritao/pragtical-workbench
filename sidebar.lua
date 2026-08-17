@@ -1,6 +1,7 @@
 local core = require "core"
 local common = require "core.common"
 local config = require "core.config"
+local SidebarHost = require "core.sidebar"
 local style = require "core.style"
 local View = require "core.view"
 
@@ -34,6 +35,7 @@ function Sidebar:try_close(do_close)
   if Sidebar.instance == self then
     Sidebar.instance = nil
   end
+  SidebarHost:unregister_view(self)
 end
 
 function Sidebar:new(options)
@@ -215,14 +217,20 @@ function Sidebar:get_item_height()
   return style.font:get_height() + style.padding.y
 end
 
+function Sidebar:get_mode_bar_height()
+  return style.font:get_height() + style.padding.y
+end
+
 function Sidebar:get_scrollable_size()
-  return style.padding.y + #self.model.rows * self:get_item_height()
+  return self:get_mode_bar_height() + style.padding.y + #self.model.rows * self:get_item_height()
 end
 
 function Sidebar:row_at(x, y)
   if x < self.position.x or x > self.position.x + self.size.x then return nil end
+  local bar_height = self:get_mode_bar_height()
+  if y < self.position.y + bar_height then return nil end
   local h = self:get_item_height()
-  local index = math.floor((y - self.position.y + self.scroll.y) / h) + 1
+  local index = math.floor((y - self.position.y - bar_height + self.scroll.y) / h) + 1
   if index < 1 or index > #self.model.rows then return nil end
   return index, self.model:get_row(index)
 end
@@ -252,6 +260,14 @@ end
 function Sidebar:on_mouse_pressed(button, x, y, clicks)
   local processed = Sidebar.super.on_mouse_pressed(self, button, x, y, clicks)
   if processed or button ~= "left" then return processed end
+  local bar_height = self:get_mode_bar_height()
+  if y >= self.position.y and y < self.position.y + bar_height then
+    local files_width = style.font:get_width("Files") + style.padding.x * 2
+    if x < self.position.x + files_width then
+      core.sidebar:show("files")
+    end
+    return true
+  end
   local index, row = self:row_at(x, y)
   if not row then return false end
   self.selected_id = row.id
@@ -312,9 +328,21 @@ end
 
 function Sidebar:draw()
   self:draw_background(style.background2)
+  local bar_height = self:get_mode_bar_height()
+  local bar_y = self.position.y
+  renderer.draw_rect(self.position.x, bar_y, self.size.x, bar_height, style.background)
+  local files_color = style.dim
+  local workbench_color = style.text
+  renderer.draw_text(style.font, "Files", self.position.x + style.padding.x,
+    bar_y + style.padding.y / 2, files_color)
+  local workbench_x = self.position.x + style.padding.x
+    + style.font:get_width("Files") + style.padding.x * 2
+  renderer.draw_text(style.font, "Workbench", workbench_x,
+    bar_y + style.padding.y / 2, workbench_color)
   local x, y = self:get_content_offset()
+  y = y + bar_height
   local h = self:get_item_height()
-  local top = self.position.y
+  local top = self.position.y + bar_height
   local bottom = top + self.size.y
   for index, row in ipairs(self.model.rows) do
     local row_y = y + (index - 1) * h + style.padding.y / 2

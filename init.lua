@@ -4,41 +4,50 @@ local command = require "core.command"
 local common = require "core.common"
 local config = require "core.config"
 local style = require "core.style"
+local SidebarHost = require "core.sidebar"
 
 local Sidebar = require "plugins.workbench.sidebar"
+
+local startup_values = {
+  always = true,
+  restore = true,
+  never = true,
+}
 
 config.plugins.workbench = common.merge({
   backend = "in_process",
   workspace = "default",
   storage_path = nil,
-  size = 240 * SCALE
+  size = 240 * SCALE,
+  startup = "restore",
+  config_spec = {
+    name = "Workbench",
+    {
+      label = "Startup",
+      description = "Control whether Workbench opens when Pragtical starts.",
+      path = "startup",
+      type = "selection",
+      default = "restore",
+      values = {
+        { "Restore previous state", "restore" },
+        { "Always open Workbench", "always" },
+        { "Never open automatically", "never" },
+      }
+    }
+  }
 }, config.plugins.workbench)
 
+if not startup_values[config.plugins.workbench.startup] then
+  config.plugins.workbench.startup = "restore"
+end
+
 local function get_view()
-  local view = Sidebar.instance
-  if not view then return nil end
-  local root_node = core.root_view and core.root_view.root_node
-  if root_node and root_node:get_node_for_view(view) then
-    return view
-  end
-  if Sidebar.instance == view then
-    Sidebar.instance = nil
-  end
-  return nil
+  if not SidebarHost:is_active("workbench") then return nil end
+  return SidebarHost:get_view("workbench")
 end
 
 local function open_view()
-  local view = get_view()
-  if not view then
-    view = Sidebar()
-    local node = core.root_view:get_active_node_default()
-    view.node = node:split("left", view, { x = true }, true)
-  end
-
-  view.visible = true
-  core.set_active_view(view)
-  core.redraw = true
-  return view
+  return SidebarHost:show("workbench")
 end
 
 local function prompt(label, submit)
@@ -76,19 +85,48 @@ local function show_import_preview(plan)
   core.status_view:show_message("i", style.text, message)
 end
 
+SidebarHost:register("workbench", function(state)
+  local legacy = Sidebar.instance
+  local root_node = core.root_view and core.root_view.root_node
+  if legacy and root_node and root_node:get_node_for_view(legacy) then
+    return legacy
+  end
+  return Sidebar.from_state(state)
+end, { restore = config.plugins.workbench.startup ~= "never" })
+
+local function add_toolbar_button()
+  local treeview = package.loaded["plugins.treeview"]
+  local toolbar = treeview and treeview.toolbar
+  if not toolbar then return end
+  for _, item in ipairs(toolbar.toolbar_commands or {}) do
+    if item.command == "workbench:open" then return end
+  end
+  table.insert(toolbar.toolbar_commands, { symbol = "W", command = "workbench:open" })
+end
+
+add_toolbar_button()
+
+local startup = config.plugins.workbench.startup
+if startup == "always"
+  or (startup == "restore" and not SidebarHost:has_saved_state())
+then
+  open_view()
+end
+
 command.add(nil, {
   ["workbench:open"] = function()
     open_view()
   end,
 
+  ["workbench:show-files"] = function()
+    SidebarHost:show("files")
+  end,
+
   ["workbench:toggle"] = function()
-    local view = get_view()
-    if not view then
-      open_view()
+    if SidebarHost:is_active("workbench") then
+      SidebarHost:toggle("workbench")
     else
-      view.visible = not view.visible
-      if view.visible then core.set_active_view(view) end
-      core.redraw = true
+      open_view()
     end
   end,
 

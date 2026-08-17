@@ -2,7 +2,8 @@ local test = require "core.test"
 local Client = require "plugins.workbench.client"
 
 local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
-assert(endpoint and endpoint ~= "", "WORKBENCH_AGENT_ENDPOINT is required")
+assert(endpoint and endpoint ~= "",
+  "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
 local function collect_output(session, seconds, expected)
   local output = {}
@@ -25,7 +26,11 @@ test.describe("Workbench agent terminal runtime", function()
       args = {
         "/V:ON", "/S", "/C",
         "echo agent-terminal-output & set /p line= & "
-          .. "echo agent-input:!line! & timeout /t 10 /nobreak >NUL",
+          .. "echo agent-input:!line! & "
+          -- timeout is console-input aware and can consume the CR/LF sent to
+          -- set /p through ConPTY. Keep the child alive without reading input.
+          .. "powershell.exe -NoProfile -NonInteractive -Command "
+          .. "Start-Sleep -Seconds 10",
       }
       input = "agent-input\r\n"
     else

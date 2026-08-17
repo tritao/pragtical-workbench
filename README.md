@@ -42,6 +42,31 @@ ConPTY and Windows named-pipe transport support are now implemented in the
 native boundary; the Windows CI job now exercises the built agent, named-pipe
 transport, ConPTY terminal lifecycle, persistence, and reconnect paths.
 
+## Sidebar behavior
+
+Workbench shares Pragtical's single left sidebar slot with Files. By default,
+the first launch opens Workbench and later launches restore the last selected
+mode and visibility. Use `workbench:open` to switch to Workbench,
+`workbench:show-files` to switch back to Files, and `workbench:toggle` to hide
+or restore the shared sidebar.
+
+The startup policy can be configured as `restore`, `always`, or `never` with
+`config.plugins.workbench.startup`.
+
+## Testing
+
+The regular Pragtical test suite does not require an agent process. Run the
+complete Workbench suite, including agent persistence and terminal tests, with:
+
+```text
+SDL_VIDEO_DRIVER=dummy ./scripts/test-workbench.sh build
+```
+
+The runner creates temporary agent state and endpoints, restarts the agent for
+the persistence test, and cleans everything up afterward. Individual agent
+test files can still be run directly by setting `WORKBENCH_AGENT_ENDPOINT` to
+an already-running compatible agent.
+
 When this repository is checked out as `data/plugins/workbench` inside
 Pragtical, the Lua files at its root are installed directly as the
 `plugins.workbench` plugin.
