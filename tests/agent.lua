@@ -5,6 +5,12 @@ local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "",
   "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
+local function find_provider(providers, id)
+  for _, provider in ipairs(providers) do
+    if provider.id == id then return provider end
+  end
+end
+
 test.describe("Workbench agent client", function()
   local client
 
@@ -45,7 +51,7 @@ test.describe("Workbench agent client", function()
     test.equal(client:snapshot().revision, 1)
     test.equal(#events, 1)
     test.equal(events[1].type, "collection.created")
-    test.equal(client:providers()[1].id, "builtin.shell")
+    test.not_nil(find_provider(client:providers(), "builtin.shell"))
 
     local resource = client:execute {
       type = "resource.create",

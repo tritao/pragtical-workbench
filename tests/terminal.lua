@@ -60,4 +60,41 @@ test.describe("Workbench terminal integration", function()
     test.equal(client:snapshot().terminals[1].status, "stopped")
     client:close()
   end)
+
+  test.test("routes a local agent provider through the provider runtime contract", function()
+    test.skip_if(PLATFORM == "Windows", "POSIX PTY launch is required")
+
+    local client = assert(Client.open {
+      backend = "in_process",
+      workspace_id = new_workspace_id(),
+    })
+    local created = client:execute {
+      type = "terminal.create",
+      id = "terminal-codex-provider",
+      title = "Codex provider",
+      provider = "builtin.codex",
+      cols = 80,
+      rows = 24,
+      status = "starting",
+      config = {
+        executable = "/bin/sh",
+        args = { "-c", "printf codex-provider-output; sleep 1" },
+      },
+    }
+    test.equal(created.code, "ok")
+
+    local session = assert(client:terminal_session("terminal-codex-provider"))
+    local output = {}
+    local deadline = system.get_time() + 2
+    while system.get_time() < deadline do
+      for _, event in ipairs(session:poll_events()) do
+        if event.type == "output" then output[#output + 1] = event.data end
+      end
+      if table.concat(output):find("codex-provider-output", 1, true) then break end
+      system.sleep(0.01)
+    end
+    test.contains(table.concat(output), "codex-provider-output")
+    test.ok(session:terminate())
+    client:close()
+  end)
 end)

@@ -210,8 +210,13 @@ function Registry:describe()
 end
 
 function Registry.default()
+  local shell = require "plugins.workbench.provider.builtin.shell"
+  local codex = require "plugins.workbench.provider.builtin.codex"
+  local opencode = require "plugins.workbench.provider.builtin.opencode"
   return Registry.new {
-    require "plugins.workbench.provider.builtin.shell",
+    shell,
+    codex,
+    opencode,
   }
 end
 

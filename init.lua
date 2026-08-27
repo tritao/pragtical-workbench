@@ -150,6 +150,20 @@ command.add(nil, {
     prompt("Terminal title", function(title) view:create_terminal_async(title) end)
   end,
 
+  ["workbench:create-codex"] = function()
+    local view = get_view() or open_view()
+    prompt("Codex session title", function(title)
+      view:create_terminal_async(title, "builtin.codex")
+    end)
+  end,
+
+  ["workbench:create-opencode"] = function()
+    local view = get_view() or open_view()
+    prompt("OpenCode session title", function(title)
+      view:create_terminal_async(title, "builtin.opencode")
+    end)
+  end,
+
   ["workbench:import-sakura"] = function()
     local view = get_view() or open_view()
     if not view.client then

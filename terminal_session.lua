@@ -47,7 +47,18 @@ local function resource_config(resource)
   return resource.config or resource.options or {}
 end
 
-local function local_options(resource, options, resource_id)
+local function local_options(client, resource, options, resource_id)
+  if client.service and client.service.providers then
+    local runtime_options, message = client.service.providers:runtime_spec(resource, options, {
+      workspace_id = client.workspace_id,
+    })
+    if not runtime_options then
+      error(message and (message.message or message.code) or "provider rejected runtime")
+    end
+    runtime_options.id = resource_id
+    runtime_options.terminate_on_detach = false
+    return runtime_options
+  end
   local configured = resource_config(resource)
   local terminal_config = config.plugins and config.plugins.terminal or {}
   local shell = options.shell or configured.shell or configured.command
@@ -112,7 +123,7 @@ function WorkbenchSession.new(client, resource, options)
   local resource_id = assert(options.runtime_id or resource.runtime_id or resource.id,
     "Workbench terminal resource requires an id")
   if client.backend == "fake" or client.backend == "in_process" then
-    local local_session = LocalSession(local_options(resource, options, resource_id))
+    local local_session = LocalSession(local_options(client, resource, options, resource_id))
     local self = setmetatable({
       client = client, resource = resource, resource_id = resource_id,
       local_session = local_session, emulator = local_session.emulator,

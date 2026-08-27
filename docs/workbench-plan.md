@@ -407,8 +407,9 @@ The trusted service-provider registry is implemented after resources, terminal
 lifecycle, and parity between in-process and agent backends. Providers declare
 resource kinds, capabilities, actions, and events, and implement resource
 normalization, runtime specifications, runtime metadata, and metadata
-validation. `builtin.shell` is the initial provider; Codex/OpenCode and
-Pragtical UI adapters remain follow-up providers.
+validation. `builtin.shell` is the initial provider. The trusted Codex and
+OpenCode terminal adapters are also implemented; richer session APIs and
+Pragtical UI adapters remain follow-up work.
 
 ## Milestones and acceptance criteria
 

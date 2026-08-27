@@ -237,14 +237,14 @@ function Sidebar:open_terminal(terminal)
   return err
 end
 
-function Sidebar:create_terminal(title)
+function Sidebar:create_terminal(title, provider)
   Sidebar.next_id = Sidebar.next_id + 1
   local collection_id
   local selected = self.selected_id and self.model.collection_by_id[self.selected_id]
   if selected then collection_id = selected.id end
   local id = "terminal-" .. tostring(math.floor(system.get_time() * 1000000))
     .. "-" .. tostring(Sidebar.next_id)
-  local result = self:execute {
+  local command = {
     type = "terminal.create",
     operation_id = id .. "-create",
     id = id,
@@ -252,8 +252,10 @@ function Sidebar:create_terminal(title)
     title = title,
     cols = 80,
     rows = 24,
-    status = "starting"
+    status = "starting",
   }
+  if provider then command.provider = provider end
+  local result = self:execute(command)
   if not result or result.code ~= "ok" then return result end
   local snapshot = self.client:snapshot()
   for _, terminal in ipairs(snapshot.terminals or {}) do
@@ -265,14 +267,18 @@ function Sidebar:create_terminal(title)
   return nil
 end
 
-function Sidebar:create_terminal_async(title, callback)
+function Sidebar:create_terminal_async(title, provider, callback)
+  if type(provider) == "function" then
+    callback = provider
+    provider = nil
+  end
   Sidebar.next_id = Sidebar.next_id + 1
   local collection_id
   local selected = self.selected_id and self.model.collection_by_id[self.selected_id]
   if selected then collection_id = selected.id end
   local id = "terminal-" .. tostring(math.floor(system.get_time() * 1000000))
     .. "-" .. tostring(Sidebar.next_id)
-  return self:execute_async({
+  local command = {
     type = "terminal.create",
     operation_id = id .. "-create",
     id = id,
@@ -280,8 +286,10 @@ function Sidebar:create_terminal_async(title, callback)
     title = title,
     cols = 80,
     rows = 24,
-    status = "starting"
-  }, function(result, error_result, request)
+    status = "starting",
+  }
+  if provider then command.provider = provider end
+  return self:execute_async(command, function(result, error_result, request)
     if error_result or not result or result.code ~= "ok" then
       if callback then callback(result, error_result, request) end
       return

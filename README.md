@@ -70,8 +70,11 @@ Providers are trusted service modules registered with Workbench. Each provider
 declares its resource kinds, capabilities, supported actions, and event types,
 and implements resource creation/update validation, runtime specification,
 runtime metadata, and provider metadata validation. The built-in
-`builtin.shell` provider owns terminal resources and native PTY launch options;
-the generic Workbench records do not contain provider-specific fields.
+`builtin.shell`, `builtin.codex`, and `builtin.opencode` providers own terminal
+resources and native PTY launch options; the generic Workbench records do not
+contain provider-specific fields. Codex and OpenCode settings such as the
+executable, model, prompt, working directory, and approval mode are
+provider-owned configuration or runtime options.
 
 Clients can inspect the registered provider contract through
 `client:providers()` or the `providers` field in a snapshot. Provider runtime
@@ -88,6 +91,11 @@ or restore the shared sidebar.
 
 The startup policy can be configured as `restore`, `always`, or `never` with
 `config.plugins.workbench.startup`.
+
+Use `workbench:create-codex` or `workbench:create-opencode` to create a
+provider-backed interactive agent terminal. The corresponding resource keeps
+the provider ID and opaque provider configuration; runtime lifecycle and
+history remain Workbench-owned.
 
 ## Testing
 

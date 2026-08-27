@@ -53,8 +53,9 @@ test.describe("Workbench agent terminal runtime", function()
       cols = 80,
       rows = 24,
       status = "starting",
+      provider = "builtin.codex",
       config = {
-        shell = shell,
+        executable = shell,
         args = args,
       },
     }
