@@ -88,4 +88,48 @@ test.describe("Workbench client", function()
     test.equal(result.code, "closed")
     test.ok(not client:is_open())
   end)
+
+  test.test("completes callback requests from poll", function()
+    local callback_result
+    local callback_error
+    local request = assert(client:execute_async({
+      type = "collection.create",
+      id = "collection-async",
+      title = "Async client",
+    }, function(result, error_result)
+      callback_result = result
+      callback_error = error_result
+    end))
+
+    test.ok(not request:is_done())
+    test.is_nil(callback_result)
+    test.equal(client:poll(), 1)
+    test.ok(request:is_done())
+    test.equal(callback_result.code, "ok")
+    test.is_nil(callback_error)
+    local value, error_result = request:result()
+    test.same(value, callback_result)
+    test.is_nil(error_result)
+  end)
+
+  test.test("cancels a request before its completion is delivered", function()
+    local callback_called = false
+    local request = assert(client:execute_async({
+      type = "collection.create",
+      id = "collection-cancelled",
+      title = "Cancelled client request",
+    }, function()
+      callback_called = true
+    end))
+
+    local cancelled, error_result = client:cancel(request)
+    test.equal(cancelled, true)
+    test.is_nil(error_result)
+    local value, request_error = request:result()
+    test.is_nil(value)
+    test.equal(request_error.code, "cancelled")
+    test.ok(callback_called)
+    client:poll()
+    test.equal(#client:snapshot().collections, 0)
+  end)
 end)

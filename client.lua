@@ -11,6 +11,24 @@ local agent_processes = {}
 local Client = {}
 Client.__index = Client
 
+local DEFAULT_REQUEST_TIMEOUT = 10
+local PENDING = {}
+
+local Request = {}
+Request.__index = Request
+
+function Request:cancel()
+  return self.client:cancel(self)
+end
+
+function Request:is_done()
+  return self.done
+end
+
+function Request:result()
+  return self.value, self.error
+end
+
 local function next_id(prefix)
   next_operation = next_operation + 1
   return prefix .. "-" .. tostring(next_operation)
@@ -127,28 +145,206 @@ local function agent_error(code, message)
   return { code = code, message = message }
 end
 
-function Client:_agent_message(message, expected_kind)
-  local ok, send_message = pcall(function()
-    return self.connection:send(Protocol.encode(message))
-  end)
-  if not ok then return nil, send_message end
-  while true do
-    local frame, receive_message = self.connection:receive(-1)
-    if not frame then
-      return nil, agent_error("agent_disconnected", receive_message or "agent disconnected")
-    end
-    local response, decode_message = Protocol.decode(frame)
-    if not response then
-      return nil, agent_error("invalid_protocol", decode_message)
-    end
-    if response.kind == "error" and response.request_id == message.request_id then
-      return nil, response.error or agent_error("agent_error", "agent rejected the request")
-    end
-    if response.kind == expected_kind and response.request_id == message.request_id then
-      return response
-    end
-    self:_handle_agent_message(response)
+function Client:_new_request(id, callback, options)
+  options = options or {}
+  local timeout = options.timeout
+  if timeout == nil then timeout = self.request_timeout or DEFAULT_REQUEST_TIMEOUT end
+  if type(timeout) ~= "number" or timeout < 0 then timeout = DEFAULT_REQUEST_TIMEOUT end
+  local request = setmetatable({
+    client = self,
+    id = id,
+    callback = callback,
+    done = false,
+    value = nil,
+    error = nil,
+    pending_ids = {},
+    deadline = system.get_time() + timeout,
+  }, Request)
+  self.requests[id] = request
+  return request
+end
+
+function Client:_finish_request(request, value, error)
+  if not request or request.done then return end
+  request.done = true
+  request.value = value
+  request.error = error
+  if self.requests[request.id] == request then
+    self.requests[request.id] = nil
   end
+  if request.callback then
+    pcall(request.callback, value, error, request)
+  end
+end
+
+function Client:_schedule_work(request, work)
+  self.completions[#self.completions + 1] = {
+    request = request,
+    work = work,
+  }
+end
+
+function Client:_drain_completions()
+  local count = 0
+  while #self.completions > 0 do
+    local completion = table.remove(self.completions, 1)
+    if not completion.request.done then
+      local ok, value = pcall(completion.work)
+      if ok then
+        self:_finish_request(completion.request, value, nil)
+      else
+        self:_finish_request(completion.request, nil, agent_error("client_error", value))
+      end
+      count = count + 1
+    end
+  end
+  return count
+end
+
+function Client:_queue_agent(message, expected_kind, request, handler)
+  if not self.connection then
+    return nil, agent_error("agent_disconnected", "Workbench agent is disconnected")
+  end
+  local encoded
+  local encoded_ok, encode_message = pcall(Protocol.encode, message)
+  if not encoded_ok then
+    return nil, agent_error("invalid_protocol", encode_message)
+  end
+  encoded = encode_message
+  local sent_ok, send_ok, send_message = pcall(function()
+    return self.connection:send(encoded)
+  end)
+  if not sent_ok then
+    return nil, agent_error("agent_disconnected", send_ok)
+  end
+  if send_ok == false then
+    return nil, agent_error("agent_disconnected", send_message or "agent send failed")
+  end
+  self.pending_requests[message.request_id] = {
+    request = request,
+    expected_kind = expected_kind,
+    handler = handler,
+    deadline = request.deadline,
+  }
+  request.pending_ids[message.request_id] = true
+  return true
+end
+
+function Client:_dispatch_agent_response(response)
+  local pending = response.request_id and self.pending_requests[response.request_id]
+  if not pending then
+    self:_handle_agent_message(response)
+    return
+  end
+
+  -- A replay gap is reported as a snapshot before the subscribed response.
+  -- It updates the client cursor but does not complete the subscription.
+  if response.kind == "snapshot" and pending.expected_kind ~= "snapshot" then
+    self:_handle_agent_message(response)
+    return
+  end
+
+  if response.kind ~= pending.expected_kind and response.kind ~= "error" then
+    self.pending_requests[response.request_id] = nil
+    pending.request.pending_ids[response.request_id] = nil
+    self:_finish_request(pending.request, nil, agent_error("invalid_protocol",
+      "unexpected Workbench response kind: " .. tostring(response.kind)))
+    return
+  end
+
+  self.pending_requests[response.request_id] = nil
+  pending.request.pending_ids[response.request_id] = nil
+  if response.kind == "error" then
+    self:_finish_request(pending.request,
+      nil, response.error or agent_error("agent_error", "agent rejected the request"))
+    return
+  end
+
+  self:_handle_agent_message(response)
+  local value, error_result = pending.handler(response)
+  if value == PENDING then return end
+  self:_finish_request(pending.request, value, error_result)
+end
+
+function Client:_fail_agent_requests(error_result)
+  if not self.pending_requests then return end
+  local requests = {}
+  local seen = {}
+  for request_id, pending in pairs(self.pending_requests) do
+    self.pending_requests[request_id] = nil
+    pending.request.pending_ids[request_id] = nil
+    if not seen[pending.request] then
+      seen[pending.request] = true
+      requests[#requests + 1] = pending.request
+    end
+  end
+  for _, request in ipairs(requests) do
+    self:_finish_request(request, nil, error_result)
+  end
+end
+
+function Client:_expire_requests(now)
+  if not self.pending_requests then return end
+  local expired = {}
+  for request_id, pending in pairs(self.pending_requests) do
+    if now >= pending.deadline then
+      self.pending_requests[request_id] = nil
+      pending.request.pending_ids[request_id] = nil
+      expired[pending.request] = true
+    end
+  end
+  for request in pairs(expired) do
+    self:_finish_request(request, nil, agent_error("timeout",
+      "Workbench request timed out"))
+  end
+end
+
+function Client:_disconnect(message)
+  local connection = self.connection
+  self.connection = nil
+  self.agent_subscribed = false
+  if connection then pcall(function() connection:close() end) end
+  self:_fail_agent_requests(agent_error("agent_disconnected", message))
+end
+
+function Client:_fail_all_requests(error_result)
+  local requests = {}
+  for _, request in pairs(self.requests) do requests[#requests + 1] = request end
+  if self.pending_requests then
+    for request_id, pending in pairs(self.pending_requests) do
+      self.pending_requests[request_id] = nil
+      pending.request.pending_ids[request_id] = nil
+    end
+  end
+  self.completions = {}
+  for _, request in ipairs(requests) do
+    self:_finish_request(request, nil, error_result)
+  end
+end
+
+function Client:_agent_message(message, expected_kind)
+  local request = self:_new_request(message.request_id)
+  local queued, send_message = self:_queue_agent(message, expected_kind, request,
+    function(response) return response end)
+  if not queued then
+    self.requests[request.id] = nil
+    return nil, send_message
+  end
+  local response, wait_message = self:_wait_request(request)
+  if not response then return nil, wait_message end
+  return response
+end
+
+function Client:_wait_request(request)
+  while not request.done do
+    local _, message = self:poll()
+    if not request.done and message and message ~= "timeout" then
+      self:cancel(request)
+      return nil, agent_error("agent_disconnected", message)
+    end
+    if not request.done then system.sleep(0.01) end
+  end
+  return request.value, request.error
 end
 
 function Client:_handle_agent_message(message)
@@ -187,47 +383,59 @@ function Client:_agent_snapshot()
   return self.agent_snapshot
 end
 
+function Client:_queue_agent_command(request, kind, payload, refresh_snapshot)
+  local message = Protocol.request(kind, next_id("workbench-request"), payload)
+  local function handle_response(response)
+    local result = response.result
+      or agent_error("invalid_response", "agent returned no result")
+    for _, event in ipairs(result.runtime_events or {}) do
+      self:_handle_agent_message(Protocol.request("event", nil, {
+        event = event,
+      }))
+    end
+    if result.code == "ok" and refresh_snapshot ~= false then
+      local snapshot_message = Protocol.request("snapshot", next_id("workbench-snapshot"), {})
+      local queued, queue_message = self:_queue_agent(snapshot_message, "snapshot", request,
+        function(snapshot_response)
+          self:_handle_agent_message(snapshot_response)
+          if not self.agent_snapshot then
+            return nil, agent_error("snapshot_missing",
+              "agent snapshot response was missing its snapshot field")
+          end
+          return result
+        end)
+      if not queued then return nil, queue_message end
+      return PENDING
+    end
+    return result
+  end
+  return self:_queue_agent(message, "result", request, handle_response)
+end
+
 function Client:_agent_execute(command, refresh_snapshot)
-  local response, message = self:_agent_message(Protocol.request("command",
-    next_id("workbench-request"), { command = command }), "result")
-  if not response then
-    if type(message) == "table" then
-      return agent_error(message.code, message.message)
-    end
-    return agent_error("agent_error", tostring(message))
+  local request, message = self:execute_async(command, nil, {
+    refresh_snapshot = refresh_snapshot,
+  })
+  if not request then
+    return type(message) == "table" and message
+      or agent_error("agent_error", tostring(message))
   end
-  local result = response.result or agent_error("invalid_response", "agent returned no result")
-  for _, event in ipairs(result.runtime_events or {}) do
-    self:_handle_agent_message(Protocol.request("event", nil, {
-      event = event,
-    }))
-  end
-  if result.code == "ok" and refresh_snapshot ~= false then
-    local snapshot = self:_agent_snapshot()
-    if not snapshot then
-      return agent_error("agent_disconnected", "agent did not return a snapshot")
-    end
-  end
-  return result
+  local result, error_result = self:_wait_request(request)
+  if result then return result end
+  return agent_error(error_result and error_result.code or "agent_error",
+    error_result and error_result.message or tostring(error_result))
 end
 
 function Client:_agent_execute_batch(commands)
-  local response, message = self:_agent_message(Protocol.request("batch",
-    next_id("workbench-batch"), { commands = commands }), "result")
-  if not response then
-    if type(message) == "table" then
-      return agent_error(message.code, message.message)
-    end
-    return agent_error("agent_error", tostring(message))
+  local request, message = self:execute_batch_async(commands, nil, {})
+  if not request then
+    return type(message) == "table" and message
+      or agent_error("agent_error", tostring(message))
   end
-  local result = response.result or agent_error("invalid_response", "agent returned no result")
-  if result.code == "ok" then
-    local snapshot = self:_agent_snapshot()
-    if not snapshot then
-      return agent_error("agent_disconnected", "agent did not return a snapshot")
-    end
-  end
-  return result
+  local result, error_result = self:_wait_request(request)
+  if result then return result end
+  return agent_error(error_result and error_result.code or "agent_error",
+    error_result and error_result.message or tostring(error_result))
 end
 
 function Client.open(options)
@@ -270,6 +478,9 @@ function Client.open(options)
       workspace_id = workspace_id,
       storage_path = storage_path,
       event_limit = options.event_limit,
+      request_timeout = options.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+      requests = {},
+      completions = {},
       closed = false,
     }, Client)
   end
@@ -299,11 +510,15 @@ function Client.open(options)
       agent_callbacks = {},
       agent_event_cursor = 0,
       agent_runtime_events = {},
+      request_timeout = options.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+      requests = {},
+      pending_requests = {},
+      completions = {},
     }, Client)
     local hello, message = client:_agent_message(Protocol.request("hello",
       next_id("workbench-hello"), {
         workspace_id = workspace_id,
-        capabilities = { event_replay = true },
+        capabilities = { event_replay = true, event_cursors = true },
       }), "hello_result")
     if not hello then
       connection:close()
@@ -340,6 +555,9 @@ function Client.open(options)
     handle = handle,
     backend = backend,
     workspace_id = workspace_id,
+    request_timeout = options.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+    requests = {},
+    completions = {},
     closed = false,
   }, Client)
 end
@@ -354,49 +572,146 @@ function Client:snapshot()
   return self.handle:snapshot()
 end
 
-function Client:execute(command)
-  if self.closed then
-    return { code = "closed", message = "Workbench client is closed" }
+function Client:execute_async(command, callback, options)
+  options = options or {}
+  if callback ~= nil and type(callback) ~= "function" then
+    return nil, agent_error("invalid_callback", "Workbench request callback must be a function")
   end
+  if self.closed then
+    return nil, agent_error("closed", "Workbench client is closed")
+  end
+  if self.connection == nil and self.handle == nil and self.service == nil then
+    return nil, agent_error("agent_disconnected", "Workbench client is unavailable")
+  end
+
   command = copy_command(self, command)
-  if self.service then return self.service:execute(command) end
-  if self.connection then return self:_agent_execute(command) end
-  return self.handle:execute(command)
+  local request = self:_new_request(next_id("workbench-request"), callback, options)
+  local function complete_immediately(method)
+    self:_schedule_work(request, method)
+  end
+
+  if self.service then
+    complete_immediately(function() return self.service:execute(command) end)
+  elseif self.connection then
+    local queued, message = self:_queue_agent_command(request, "command",
+      { command = command }, options.refresh_snapshot ~= false)
+    if not queued then
+      self.requests[request.id] = nil
+      return nil, message
+    end
+  else
+    complete_immediately(function() return self.handle:execute(command) end)
+  end
+  return request
 end
 
-function Client:execute_batch(commands)
+function Client:execute(command, callback, options)
+  if type(callback) == "table" and options == nil then
+    options, callback = callback, nil
+  end
+  if type(callback) == "function" then
+    return self:execute_async(command, callback, options)
+  end
   if self.closed then
     return { code = "closed", message = "Workbench client is closed" }
   end
+  local request, message = self:execute_async(command, nil, options)
+  if not request then return message end
+  local result, error_result = self:_wait_request(request)
+  return result or error_result or agent_error("client_error", "Workbench request failed")
+end
+
+function Client:execute_batch_async(commands, callback, options)
+  options = options or {}
+  if callback ~= nil and type(callback) ~= "function" then
+    return nil, agent_error("invalid_callback", "Workbench request callback must be a function")
+  end
+  if self.closed then
+    return nil, agent_error("closed", "Workbench client is closed")
+  end
   if type(commands) ~= "table" or #commands == 0 then
-    return { code = "invalid_command", message = "command batch must not be empty" }
+    return nil, agent_error("invalid_command", "command batch must not be empty")
   end
 
   local prepared = {}
-  local revision = self:snapshot().revision
+  local snapshot = self:snapshot()
+  local revision = snapshot and snapshot.revision
+  if revision == nil then
+    return nil, agent_error("client_error", "Workbench snapshot is unavailable")
+  end
   for index, command in ipairs(commands) do
+    if type(command) ~= "table" then
+      return nil, agent_error("invalid_command", "command batch entries must be tables")
+    end
     local value = copy_command(self, command)
     if command.expected_revision == nil then
       value.expected_revision = revision + index - 1
     end
     prepared[#prepared + 1] = value
   end
-  if self.service then return self.service:execute_batch(prepared) end
-  if self.connection then return self:_agent_execute_batch(prepared) end
 
-  local results = {}
-  for _, command in ipairs(prepared) do
-    local result = self.handle:execute(command)
-    results[#results + 1] = result
-    if result.code ~= "ok" then
-      return {
-        code = result.code,
-        message = result.message,
-        results = results,
-      }
-    end
+  local request = self:_new_request(next_id("workbench-batch"), callback, options)
+  local function complete_immediately(method)
+    self:_schedule_work(request, method)
   end
-  return { code = "ok", revision = self:snapshot().revision, results = results }
+
+  if self.service then
+    complete_immediately(function() return self.service:execute_batch(prepared) end)
+  elseif self.connection then
+    local queued, message = self:_queue_agent_command(request, "batch",
+      { commands = prepared }, options.refresh_snapshot ~= false)
+    if not queued then
+      self.requests[request.id] = nil
+      return nil, message
+    end
+  else
+    complete_immediately(function()
+      local results = {}
+      for _, command in ipairs(prepared) do
+        local result = self.handle:execute(command)
+        results[#results + 1] = result
+        if result.code ~= "ok" then
+          return {
+            code = result.code,
+            message = result.message,
+            results = results,
+          }
+        end
+      end
+      return { code = "ok", revision = self:snapshot().revision, results = results }
+    end)
+  end
+  return request
+end
+
+function Client:execute_batch(commands, callback, options)
+  if type(callback) == "table" and options == nil then
+    options, callback = callback, nil
+  end
+  if type(callback) == "function" then
+    return self:execute_batch_async(commands, callback, options)
+  end
+  if self.closed then
+    return { code = "closed", message = "Workbench client is closed" }
+  end
+  local request, message = self:execute_batch_async(commands, nil, options)
+  if not request then return message end
+  local result, error_result = self:_wait_request(request)
+  return result or error_result or agent_error("client_error", "Workbench batch failed")
+end
+
+function Client:cancel(request_or_id)
+  local request = type(request_or_id) == "table" and request_or_id
+    or self.requests[request_or_id]
+  if not request then return false, agent_error("not_found", "Workbench request not found") end
+  if request.done then return false, agent_error("already_done", "Workbench request is complete") end
+
+  for request_id in pairs(request.pending_ids) do
+    if self.pending_requests then self.pending_requests[request_id] = nil end
+    request.pending_ids[request_id] = nil
+  end
+  self:_finish_request(request, nil, agent_error("cancelled", "Workbench request was cancelled"))
+  return true
 end
 
 function Client:on_event(callback)
@@ -405,13 +720,24 @@ function Client:on_event(callback)
     self.agent_callbacks[#self.agent_callbacks + 1] = callback
     if not self.agent_subscribed then
       self.agent_subscribed = true
-      local response, message = self:_agent_message(Protocol.request("subscribe",
-        next_id("workbench-subscribe"), {
+      local subscription_id = next_id("workbench-subscribe")
+      local request = self:_new_request(subscription_id, function(_, error_result)
+        if error_result then
+          self.agent_subscribed = false
+          self.agent_subscription_error = error_result
+        end
+      end, {})
+      local queued, message = self:_queue_agent(Protocol.request("subscribe",
+        subscription_id, {
           workspace_id = self.workspace_id,
           after_event_sequence = self.agent_event_cursor,
-        }), "subscribed")
-      if not response then
+        }), "subscribed", request, function(response)
+          return response
+        end)
+      if not queued then
+        self.requests[request.id] = nil
         self.agent_subscribed = false
+        table.remove(self.agent_callbacks)
         return nil, message
       end
     end
@@ -431,19 +757,44 @@ function Client:on_event(callback)
 end
 
 function Client:poll()
-  if self.service then return self.service:poll() end
+  if self.service then
+    self.service:poll()
+    return self:_drain_completions()
+  end
   if self.connection then
-    local count = 0
+    local count = self:_drain_completions()
+    self:_expire_requests(system.get_time())
     while true do
-      local frame, message = self.connection:receive(0)
-      if not frame then return count, message end
+      local received, frame, message = pcall(function()
+        return self.connection:receive(0)
+      end)
+      if not received then
+        self:_disconnect(frame)
+        return count, frame
+      end
+      if not frame then
+        if message ~= "timeout" then
+          self:_disconnect(message or "Workbench agent disconnected")
+        end
+        self:_expire_requests(system.get_time())
+        return count, message
+      end
       local response, decode_message = Protocol.decode(frame)
-      if not response then return count, decode_message end
-      self:_handle_agent_message(response)
+      if not response then
+        local error_result = agent_error("invalid_protocol", decode_message)
+        self:_disconnect(decode_message)
+        return count, error_result
+      end
+      self:_dispatch_agent_response(response)
       count = count + 1
     end
   end
-  return self.handle:poll()
+  local count = self:_drain_completions()
+  if self.handle then
+    local polled = self.handle:poll()
+    return count + (type(polled) == "number" and polled or 0), polled
+  end
+  return count
 end
 
 function Client:write_runtime(runtime_id, data)
@@ -577,6 +928,7 @@ function Client:terminal_session(resource_id, options)
 end
 
 function Client:close()
+  self:_fail_all_requests(agent_error("closed", "Workbench client is closed"))
   if self.connection then
     pcall(function()
       self.connection:send(Protocol.encode(Protocol.request("close", nil, {})))

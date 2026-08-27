@@ -42,6 +42,23 @@ ConPTY and Windows named-pipe transport support are now implemented in the
 native boundary; the Windows CI job now exercises the built agent, named-pipe
 transport, ConPTY terminal lifecycle, persistence, and reconnect paths.
 
+Commands can be submitted without blocking the caller:
+
+```lua
+local request = client:execute(command, function(result, error)
+  if error then return end
+  -- apply result
+end)
+
+client:poll()
+request:cancel()
+```
+
+Requests have bounded deadlines, expose `is_done()` and `result()`, and are
+completed from `poll()`. The callback form is shared by the agent and
+in-process backends; the no-callback form remains a bounded synchronous
+convenience wrapper.
+
 ## Sidebar behavior
 
 Workbench shares Pragtical's single left sidebar slot with Files. By default,
