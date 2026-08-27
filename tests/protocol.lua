@@ -5,7 +5,7 @@ local Protocol = require "plugins.workbench.service.protocol"
 test.describe("Workbench protocol", function()
   test.test("round-trips deterministic control messages", function()
     local message = {
-      protocol = 1,
+      protocol = 2,
       kind = "command",
       request_id = "request-1",
       command = {
@@ -23,7 +23,7 @@ test.describe("Workbench protocol", function()
     test.same(decoded, message)
   end)
 
-  test.test("supports integer boundaries used by revisions and offsets", function()
+  test.test("supports integer boundaries used by revisions and event cursors", function()
     local value = {
       zero = 0,
       positive = 4294967295,
@@ -54,5 +54,26 @@ test.describe("Workbench protocol", function()
     local decoded = assert(Protocol.decode(frame))
     test.equal(decoded.kind, "batch")
     test.equal(decoded.commands[1].type, "workspace.rename")
+  end)
+
+  test.test("validates event cursor messages", function()
+    local frame = Protocol.encode {
+      kind = "subscribe",
+      request_id = "subscribe-1",
+      after_event_sequence = 17,
+    }
+    local decoded = assert(Protocol.decode(frame))
+    test.equal(decoded.after_event_sequence, 17)
+
+    local invalid = Protocol.encode {
+      kind = "subscribe",
+      request_id = "subscribe-2",
+      after_event_sequence = 17,
+    }
+    local message = assert(Protocol.decode(invalid))
+    message.after_event_sequence = 1.5
+    local ok, error_message = pcall(Protocol.encode, message)
+    test.equal(ok, false)
+    test.ok(tostring(error_message):match("non%-negative integer"))
   end)
 end)

@@ -1,6 +1,7 @@
 local migrations = {
   require "plugins.workbench.service.migration.003_schema",
   require "plugins.workbench.service.migration.004_operation_digests",
+  require "plugins.workbench.service.migration.005_event_cursors",
 }
 
 local Migration = {}
@@ -43,7 +44,7 @@ function Migration.apply(db)
 
   local applied = {}
   for _, row in ipairs(query(db, "SELECT version FROM schema_migrations")) do
-    if row.version ~= 3 and row.version ~= 4 then
+    if row.version ~= 3 and row.version ~= 4 and row.version ~= 5 then
       error("unsupported Workbench schema version " .. tostring(row.version)
         .. "; this database must be recreated")
     end

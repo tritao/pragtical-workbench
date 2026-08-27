@@ -1,7 +1,7 @@
 local MessagePack = require "plugins.workbench.service.msgpack"
 
 local protocol = {
-  version = 1,
+  version = 2,
   max_message_size = 16 * 1024 * 1024,
 }
 
@@ -32,6 +32,10 @@ local required = {
   error = { "error" },
 }
 
+local function valid_cursor(value)
+  return type(value) == "number" and value >= 0 and value == math.floor(value)
+end
+
 local function validate(message)
   if type(message) ~= "table" then return nil, "protocol message must be a map" end
   if message.protocol ~= protocol.version then
@@ -47,6 +51,23 @@ local function validate(message)
   end
   if message.kind == "batch" and type(message.commands) ~= "table" then
     return nil, "Workbench batch commands must be a table"
+  end
+  if message.kind == "subscribe" and message.after_event_sequence ~= nil
+      and not valid_cursor(message.after_event_sequence) then
+    return nil, "Workbench event cursor must be a non-negative integer"
+  end
+  if message.kind == "event" and message.event_sequence ~= nil
+      and not valid_cursor(message.event_sequence) then
+    return nil, "Workbench event sequence must be a non-negative integer"
+  end
+  if message.kind == "subscribed" and message.event_cursor ~= nil
+      and not valid_cursor(message.event_cursor) then
+    return nil, "Workbench event cursor must be a non-negative integer"
+  end
+  if message.kind == "snapshot" and message.snapshot
+      and message.snapshot.event_cursor ~= nil
+      and not valid_cursor(message.snapshot.event_cursor) then
+    return nil, "Workbench snapshot cursor must be a non-negative integer"
   end
   return true
 end

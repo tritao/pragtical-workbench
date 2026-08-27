@@ -17,14 +17,6 @@ local function error_message(request_id, code, message)
   })
 end
 
-local function event_offset(service, event)
-  if event.offset ~= nil then return event.offset end
-  for index, current in ipairs(service.events) do
-    if current == event then return service.event_offset + index - 1 end
-  end
-  return service.event_offset + #service.events
-end
-
 local function safe_id(value)
   return tostring(value):gsub("[^%w_.-]", "_")
 end
@@ -315,7 +307,7 @@ end
 local function event_message(item)
   return Protocol.request("event", nil, {
     event = item.event,
-    offset = item.offset,
+    event_sequence = item.event.event_sequence,
   })
 end
 
@@ -329,7 +321,6 @@ local function run_client(service, connection, options, runtimes, history_direct
     if subscribed then
       pending_events[#pending_events + 1] = {
         event = event,
-        offset = event_offset(service, event),
       }
     end
   end
@@ -383,6 +374,7 @@ local function run_client(service, connection, options, runtimes, history_direct
             revision = service.revision,
             capabilities = {
               event_replay = true,
+              event_cursors = true,
               sqlite = true,
               runtimes = true,
               runtime_replay = true,
@@ -397,12 +389,12 @@ local function run_client(service, connection, options, runtimes, history_direct
         if unsubscribe then unsubscribe() end
         subscribed = true
         unsubscribe = service:subscribe(queue_event)
-        local events, replay_error = service:get_events(message.offset or 0)
+        local events, replay_error = service:get_events(message.after_event_sequence or 0)
         if events then
-          for index, event in ipairs(events) do
+          for _, event in ipairs(events) do
             local ok, send_message = send(connection, Protocol.request("event", nil, {
               event = event,
-              offset = (message.offset or 0) + index - 1,
+              event_sequence = event.event_sequence,
             }))
             if not ok then return nil, send_message end
           end
@@ -415,7 +407,7 @@ local function run_client(service, connection, options, runtimes, history_direct
         end
         local ok, send_message = send(connection, Protocol.request("subscribed", message.request_id, {
           revision = service.revision,
-          offset = service.event_offset + #service.events,
+          event_cursor = service.event_sequence,
         }))
         if not ok then return nil, send_message end
       elseif message.kind == "batch" then

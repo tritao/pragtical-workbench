@@ -162,14 +162,17 @@ function Client:_handle_agent_message(message)
       end
       events[#events + 1] = event
     else
-      if message.offset then self.agent_event_offset = message.offset + 1 end
+      local event_sequence = message.event_sequence or event.event_sequence
+      if event_sequence then self.agent_event_cursor = event_sequence end
       for _, callback in ipairs(self.agent_callbacks or {}) do
         pcall(callback, event)
       end
     end
   elseif message.kind == "snapshot" and message.snapshot then
     self.agent_snapshot = message.snapshot
-    self.agent_event_offset = message.snapshot.event_offset or self.agent_event_offset
+    self.agent_event_cursor = message.snapshot.event_cursor or self.agent_event_cursor
+  elseif message.kind == "subscribed" and message.event_cursor then
+    self.agent_event_cursor = message.event_cursor
   end
 end
 
@@ -197,7 +200,6 @@ function Client:_agent_execute(command, refresh_snapshot)
   for _, event in ipairs(result.runtime_events or {}) do
     self:_handle_agent_message(Protocol.request("event", nil, {
       event = event,
-      offset = event.offset,
     }))
   end
   if result.code == "ok" and refresh_snapshot ~= false then
@@ -295,7 +297,7 @@ function Client.open(options)
       endpoint = endpoint,
       closed = false,
       agent_callbacks = {},
-      agent_event_offset = 0,
+      agent_event_cursor = 0,
       agent_runtime_events = {},
     }, Client)
     local hello, message = client:_agent_message(Protocol.request("hello",
@@ -406,7 +408,7 @@ function Client:on_event(callback)
       local response, message = self:_agent_message(Protocol.request("subscribe",
         next_id("workbench-subscribe"), {
           workspace_id = self.workspace_id,
-          offset = self.agent_event_offset,
+          after_event_sequence = self.agent_event_cursor,
         }), "subscribed")
       if not response then
         self.agent_subscribed = false

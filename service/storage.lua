@@ -131,12 +131,16 @@ end
 local function load_events(db, workspace_id, limit)
   local events = {}
   local rows = query(db, [[
-    SELECT payload FROM events WHERE workspace_id = ? ORDER BY event_id DESC
+    SELECT payload, event_sequence FROM events WHERE workspace_id = ?
+      ORDER BY event_sequence DESC
       LIMIT ?
   ]], { workspace_id, limit or DEFAULT_EVENT_LIMIT })
   for index = #rows, 1, -1 do
     local event = decode(rows[index].payload)
-    if event then events[#events + 1] = event end
+    if event then
+      event.event_sequence = rows[index].event_sequence
+      events[#events + 1] = event
+    end
   end
   return events
 end
@@ -205,7 +209,7 @@ end
 
 function Storage:load(workspace_id)
   local row = query(self.db, [[
-    SELECT id, name, revision, sequence, event_offset
+    SELECT id, name, revision, sequence, event_sequence
       FROM workspaces WHERE id = ?
   ]], { workspace_id })[1]
   if not row then return nil end
@@ -216,7 +220,7 @@ function Storage:load(workspace_id)
     name = row.name,
     revision = row.revision,
     sequence = row.sequence,
-    event_offset = row.event_offset or 0,
+    event_sequence = row.event_sequence or 0,
     collections = load_collections(self.db, workspace_id),
     tasks = load_tasks(self.db, workspace_id),
     resources = load_resources(self.db, workspace_id),
@@ -373,7 +377,7 @@ function Storage:commit(service, operation_id, result, events, command_digest,
     end
     if not workspace then
       execute(self.db, [[
-        INSERT INTO workspaces(id, name, revision, sequence, event_offset)
+        INSERT INTO workspaces(id, name, revision, sequence, event_sequence)
         VALUES (?, ?, 0, 0, 0)
       ]], { service.workspace_id, service.name })
     end
@@ -418,16 +422,17 @@ function Storage:commit(service, operation_id, result, events, command_digest,
     })
     for _, event in ipairs(events or {}) do
       execute(self.db, [[
-        INSERT INTO events(workspace_id, revision, payload) VALUES (?, ?, ?)
-      ]], { service.workspace_id, service.revision, encode(event) })
+        INSERT INTO events(workspace_id, event_sequence, revision, payload)
+        VALUES (?, ?, ?, ?)
+      ]], { service.workspace_id, event.event_sequence, service.revision, encode(event) })
     end
     local event_limit = service.event_limit or self.event_limit
     execute(self.db, [[
       DELETE FROM events
        WHERE workspace_id = ?
-         AND event_id NOT IN (
-           SELECT event_id FROM events
-            WHERE workspace_id = ? ORDER BY event_id DESC LIMIT ?
+         AND event_sequence NOT IN (
+           SELECT event_sequence FROM events
+            WHERE workspace_id = ? ORDER BY event_sequence DESC LIMIT ?
          )
     ]], { service.workspace_id, service.workspace_id, event_limit })
     local operation_limit = service.operation_limit or self.operation_limit
@@ -442,10 +447,10 @@ function Storage:commit(service, operation_id, result, events, command_digest,
     ]], { service.workspace_id, service.workspace_id, operation_limit })
     execute(self.db, [[
       UPDATE workspaces
-         SET name = ?, revision = ?, sequence = ?, event_offset = ?
+         SET name = ?, revision = ?, sequence = ?, event_sequence = ?
        WHERE id = ? AND revision = ?
     ]], {
-      service.name, service.revision, service.sequence, service.event_offset or 0,
+      service.name, service.revision, service.sequence, service.event_sequence or 0,
       service.workspace_id, expected,
     })
     if self.db:changes() ~= 1 then

@@ -136,7 +136,7 @@ function Service.new(options)
     operation_digests = {},
     listeners = {},
     events = {},
-    event_offset = 0,
+    event_sequence = 0,
     event_limit = event_limit,
     operation_limit = operation_limit,
     store = options.store,
@@ -159,11 +159,10 @@ function Service.new(options)
     service.operations = persisted.operations or {}
     service.operation_digests = persisted.operation_digests or {}
     service.events = persisted.events or {}
-    service.event_offset = persisted.event_offset or 0
+    service.event_sequence = persisted.event_sequence or 0
   end
   while #service.events > service.event_limit do
     table.remove(service.events, 1)
-    service.event_offset = service.event_offset + 1
   end
   trim_operations(service)
   return service
@@ -214,7 +213,7 @@ function Service:_state()
     operations = copy(self.operations),
     operation_digests = copy(self.operation_digests),
     events = copy(self.events),
-    event_offset = self.event_offset,
+    event_sequence = self.event_sequence,
   }
 end
 
@@ -230,7 +229,7 @@ function Service:_restore(state)
   self.operations = state.operations
   self.operation_digests = state.operation_digests
   self.events = state.events
-  self.event_offset = state.event_offset
+  self.event_sequence = state.event_sequence
 end
 
 function Service:_commit(operation_id, command_digest, changes, extra, checkpoint)
@@ -239,18 +238,15 @@ function Service:_commit(operation_id, command_digest, changes, extra, checkpoin
   self.revision = self.revision + 1
   local emitted = {}
   for _, event in ipairs(changes) do
+    self.event_sequence = self.event_sequence + 1
     event.revision = self.revision
     event.workspace_id = self.workspace_id
+    event.event_sequence = self.event_sequence
     self.events[#self.events + 1] = copy(event)
     emitted[#emitted + 1] = event
   end
   while #self.events > self.event_limit do
     table.remove(self.events, 1)
-    self.event_offset = self.event_offset + 1
-  end
-  local first_event_offset = self.event_offset + #self.events - #emitted
-  for index, event in ipairs(emitted) do
-    event.offset = first_event_offset + index - 1
   end
 
   local result = merge({
@@ -320,23 +316,27 @@ function Service:snapshot()
     terminals = terminals,
     runtimes = sorted_records(self.runtimes),
     provider_metadata = sorted_records(self.provider_metadata),
-    event_offset = self.event_offset,
+    event_cursor = self.event_sequence,
   }
 end
 
-function Service:get_events(offset)
-  offset = offset or 0
-  if offset < self.event_offset then
+function Service:get_events(after_event_sequence)
+  after_event_sequence = after_event_sequence or 0
+  local oldest_event_sequence = self.events[1] and self.events[1].event_sequence
+    or self.event_sequence + 1
+  if after_event_sequence < oldest_event_sequence - 1 then
     return nil, {
       code = "snapshot_required",
-      oldest_offset = self.event_offset,
+      oldest_event_sequence = oldest_event_sequence,
+      event_cursor = self.event_sequence,
       revision = self.revision,
     }
   end
   local result = {}
-  local index = offset - self.event_offset + 1
-  for current = index, #self.events do
-    result[#result + 1] = copy(self.events[current])
+  for _, event in ipairs(self.events) do
+    if event.event_sequence > after_event_sequence then
+      result[#result + 1] = copy(event)
+    end
   end
   return result
 end

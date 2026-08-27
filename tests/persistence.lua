@@ -275,12 +275,15 @@ test.describe("Workbench SQLite persistence", function()
       }
       test.equal(result.code, "ok")
     end
-    test.equal(service:snapshot().event_offset, 1)
+    test.equal(service:snapshot().event_cursor, 3)
     local events, error_result = service:get_events(0)
     test.equal(events, nil)
     test.equal(error_result.code, "snapshot_required")
+    test.equal(error_result.oldest_event_sequence, 2)
     events = assert(service:get_events(1))
     test.equal(#events, 2)
+    test.equal(events[1].event_sequence, 2)
+    test.equal(events[2].event_sequence, 3)
     service:close()
 
     local reopened = Service.new {
@@ -288,7 +291,7 @@ test.describe("Workbench SQLite persistence", function()
       store = assert(Storage.new(path, { event_limit = 2 })),
       event_limit = 2,
     }
-    test.equal(reopened:snapshot().event_offset, 1)
+    test.equal(reopened:snapshot().event_cursor, 3)
     events, error_result = reopened:get_events(0)
     test.equal(events, nil)
     test.equal(error_result.code, "snapshot_required")

@@ -238,7 +238,7 @@ service/migration/
 The native SQLite binding remains deliberately small and supports parameterized
 execution and transactions. Persistence must update state, revision,
 operation record, and events atomically, retain enough history for normal
-reconnects, and fall back to a fresh snapshot when an event offset is gone.
+reconnects, and fall back to a fresh snapshot when an event sequence is no longer retained.
 
 ## IPC and protocol
 
