@@ -27,7 +27,7 @@ local function call_runtime(client, method, runtime_id, ...)
   elseif method == "stop_runtime" then
     local result = client:execute {
       type = "terminal.status", operation_id = operation_id(runtime_id, "stop"),
-      terminal_id = runtime_id, status = "closed"
+      terminal_id = runtime_id, status = "stopped"
     }
     return result.code == "ok", result
   elseif method == "detach_runtime" then
@@ -67,7 +67,8 @@ local function local_options(resource, options, resource_id)
 end
 
 local function local_status(local_session)
-  return local_session:status()
+  local status = local_session:status()
+  return status == "closed" and "stopped" or status
 end
 
 function WorkbenchSession:_persist_status(status)
@@ -172,7 +173,7 @@ function WorkbenchSession.new(client, resource, options)
     end,
     terminate = function(_, terminate_options)
       local result = call_runtime(client, "stop_runtime", resource_id, terminate_options or {})
-      self.status_name = "closed"
+      self.status_name = "stopped"
       self.session:set_status("closed")
       return result
     end,

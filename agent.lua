@@ -82,6 +82,63 @@ local function preflight(service, command)
   end
 end
 
+local function copy_table(value)
+  local result = {}
+  for key, item in pairs(value or {}) do result[key] = item end
+  return result
+end
+
+local function ensure_operation_id(command, runtime_id, phase)
+  local operation_id = command.operation_id or command.id
+  if not operation_id then
+    operation_id = "agent-runtime-" .. phase .. "-" .. safe_id(runtime_id)
+    command.operation_id = operation_id
+  end
+  return operation_id
+end
+
+local function transition_operation_id(runtime_id, phase, revision)
+  return "agent-runtime-" .. phase .. "-" .. safe_id(runtime_id)
+    .. "-" .. tostring(revision)
+end
+
+local function runtime_transition(service, command, runtime_id, status, fields,
+    operation_id, expected_revision)
+  local existing = service.runtimes[runtime_id] or {}
+  local runtime = {
+    id = runtime_id,
+    resource_id = fields and fields.resource_id or existing.resource_id,
+    status = status,
+  }
+  for _, field in ipairs {
+    "started_at", "ended_at", "output_bytes", "output_offset", "history_path",
+    "pid", "metadata"
+  } do
+    if fields and fields[field] ~= nil then runtime[field] = fields[field] end
+  end
+  return service:execute {
+    type = "runtime.update",
+    operation_id = operation_id,
+    workspace_id = service.workspace_id,
+    expected_revision = expected_revision == nil and service.revision or expected_revision,
+    runtime = runtime,
+  }
+end
+
+local function runtime_failure_metadata(runtime, message)
+  local metadata = {}
+  for key, value in pairs(runtime and runtime.metadata or {}) do metadata[key] = value end
+  metadata.error = tostring(message)
+  return metadata
+end
+
+local function runtime_recovery_metadata(runtime, previous_status)
+  local metadata = {}
+  for key, value in pairs(runtime and runtime.metadata or {}) do metadata[key] = value end
+  metadata.recovered_from = previous_status
+  return metadata
+end
+
 local function runtime_options(resource, command)
   local config = resource.config or {}
   local shell = command.shell or command.command or config.shell or config.command
@@ -99,21 +156,22 @@ local function runtime_options(resource, command)
   }
 end
 
-local function start_runtime(service, runtimes, history_directory, command)
-  local previous = preflight(service, command)
+local function start_runtime(service, runtimes, history_directory, command, skip_preflight)
+  local resource_id = command.resource_id or command.terminal_id or command.runtime_id
+  local runtime_id = command.runtime_id or resource_id
+  local operation_id = ensure_operation_id(command, runtime_id, "start")
+  local previous = not skip_preflight and preflight(service, command)
   if previous then return previous end
 
-  local resource_id = command.resource_id or command.terminal_id or command.runtime_id
   local resource = resource_id and service.resources[resource_id]
   if not resource then
     return service_error(service, command, "not_found",
       "resource not found: " .. tostring(resource_id))
   end
-  local runtime_id = command.runtime_id or resource_id
   local current = runtime_state(runtimes, runtime_id)
   if current and current.runtime then
     return {
-      code = "ok", operation_id = command.operation_id,
+      code = "ok", operation_id = operation_id,
       revision = service.revision, runtime_id = runtime_id,
     }
   end
@@ -126,75 +184,158 @@ local function start_runtime(service, runtimes, history_directory, command)
     return service_error(service, command, "storage_error", history_message)
   end
 
-  local ok, native_or_message = pcall(runtime_native.new, runtime_options(resource, command))
-  if not ok then
-    return service_error(service, command, "runtime_error", tostring(native_or_message))
-  end
-  if not native_or_message then
-    return service_error(service, command, "runtime_error", "failed to create runtime")
-  end
-
+  local options = runtime_options(resource, command)
   local state = current or {
     id = runtime_id,
     resource_id = resource_id,
     pending = {},
   }
-  state.runtime = native_or_message
   state.resource_id = resource_id
   state.history_path = history_path
   state.offset = offset
   state.output_bytes = offset
-  state.started_at = timestamp()
+  state.status = "starting"
   runtimes[runtime_id] = state
 
-  local result = service:execute {
-    type = "runtime.update",
-    operation_id = command.operation_id,
-    workspace_id = command.workspace_id,
-    expected_revision = command.expected_revision,
-    runtime = {
-      id = runtime_id,
-      resource_id = resource_id,
-      status = "running",
-      started_at = state.started_at,
-      output_bytes = state.output_bytes,
-      output_offset = state.offset,
-      history_path = history_path,
-      metadata = { shell = runtime_options(resource, command).command },
-    },
-  }
+  local starting = runtime_transition(service, command, runtime_id, "starting", {
+    resource_id = resource_id,
+    output_bytes = offset,
+    output_offset = offset,
+    history_path = history_path,
+    metadata = { shell = options.command },
+  }, transition_operation_id(runtime_id, "starting", service.revision),
+    command.expected_revision)
+  if starting.code ~= "ok" then
+    runtimes[runtime_id] = current
+    return starting
+  end
+
+  local ok, native_or_message = pcall(runtime_native.new, options)
+  if not ok then
+    local message = tostring(native_or_message)
+    local failed = runtime_transition(service, command, runtime_id, "failed", {
+      resource_id = resource_id, ended_at = timestamp(), output_bytes = offset,
+      output_offset = offset, history_path = history_path,
+      metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
+    }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
+    state.status = failed.code == "ok" and "failed" or "starting"
+    return service_error(service, command, "runtime_error", message)
+  end
+  if not native_or_message then
+    local message = "failed to create runtime"
+    local failed = runtime_transition(service, command, runtime_id, "failed", {
+      resource_id = resource_id, ended_at = timestamp(), output_bytes = offset,
+      output_offset = offset, history_path = history_path,
+      metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
+    }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
+    state.status = failed.code == "ok" and "failed" or "starting"
+    return service_error(service, command, "runtime_error", message)
+  end
+
+  state.runtime = native_or_message
+  state.started_at = timestamp()
+  local result = runtime_transition(service, command, runtime_id, "running", {
+    resource_id = resource_id,
+    started_at = state.started_at,
+    output_bytes = state.output_bytes,
+    output_offset = state.offset,
+    history_path = history_path,
+    metadata = { shell = options.command },
+  }, operation_id, service.revision)
   if result.code ~= "ok" then
     pcall(function() state.runtime:close() end)
     state.runtime = nil
+    local failed = runtime_transition(service, command, runtime_id, "failed", {
+      resource_id = resource_id, ended_at = timestamp(), output_bytes = offset,
+      output_offset = offset, history_path = history_path,
+      metadata = runtime_failure_metadata(service.runtimes[runtime_id], result.message),
+    }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
+    state.status = failed.code == "ok" and "failed" or "starting"
     return result
   end
+  state.status = "running"
   return result
 end
 
-local function stop_runtime(service, runtimes, command)
-  local previous = preflight(service, command)
-  if previous then return previous end
+local function stop_runtime(service, runtimes, command, skip_preflight)
   local runtime_id = command.runtime_id or command.resource_id or command.terminal_id
+  local operation_id = ensure_operation_id(command, runtime_id, "stop")
+  local previous = not skip_preflight and preflight(service, command)
+  if previous then return previous end
   local state = runtime_state(runtimes, runtime_id)
-  if state and state.runtime then
-    pcall(function() state.runtime:close() end)
+  local persisted = service.runtimes[runtime_id]
+  if not state and not persisted then
+    return service_error(service, command, "not_found",
+      "runtime not found: " .. tostring(runtime_id))
+  end
+  if not state then
+    state = {
+      id = runtime_id,
+      resource_id = persisted.resource_id,
+      pending = {},
+      history_path = persisted.history_path,
+      offset = persisted.output_offset or 0,
+      output_bytes = persisted.output_bytes or 0,
+      status = persisted.status,
+    }
+    runtimes[runtime_id] = state
+  end
+
+  local stopping = runtime_transition(service, command, runtime_id, "stopping", {
+    resource_id = state.resource_id,
+    output_bytes = state.output_bytes,
+    output_offset = state.offset,
+    history_path = state.history_path,
+  }, transition_operation_id(runtime_id, "stopping", service.revision),
+    skip_preflight and service.revision or command.expected_revision)
+  if stopping.code ~= "ok" then return stopping end
+  state.status = "stopping"
+
+  if state.runtime then
+    local closed, close_message = pcall(function() return state.runtime:close() end)
+    if not closed or close_message == false then
+      state.status = "failed"
+      local message = closed and "runtime close failed" or tostring(close_message)
+      runtime_transition(service, command, runtime_id, "failed", {
+        resource_id = state.resource_id, ended_at = timestamp(),
+        output_bytes = state.output_bytes, output_offset = state.offset,
+        history_path = state.history_path,
+        metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
+      }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
+      return service_error(service, command, "runtime_error", message)
+    end
     state.runtime = nil
   end
-  local result = service:execute {
-    type = "runtime.update",
-    operation_id = command.operation_id,
-    workspace_id = command.workspace_id,
-    expected_revision = command.expected_revision,
-    runtime = {
-      id = runtime_id,
-      resource_id = command.resource_id or command.terminal_id or runtime_id,
-      status = "closed",
-      ended_at = timestamp(),
-      output_bytes = state and state.output_bytes or nil,
-      output_offset = state and state.offset or nil,
-    },
-  }
+
+  local result = runtime_transition(service, command, runtime_id, "stopped", {
+    resource_id = state.resource_id,
+    ended_at = timestamp(),
+    output_bytes = state.output_bytes,
+    output_offset = state.offset,
+    history_path = state.history_path,
+  }, operation_id, service.revision)
+  if result.code == "ok" then state.status = "stopped" end
   return result
+end
+
+local function restart_runtime(service, runtimes, history_directory, command)
+  local operation_id = ensure_operation_id(command,
+    command.runtime_id or command.resource_id or command.terminal_id, "restart")
+  local previous = preflight(service, command)
+  if previous then return previous end
+
+  local stop_command = copy_table(command)
+  stop_command.operation_id = transition_operation_id(
+    command.runtime_id or command.resource_id or command.terminal_id, "restart-stop",
+    service.revision)
+  stop_command.expected_revision = service.revision
+  local stopped = stop_runtime(service, runtimes, stop_command, true)
+  if stopped.code ~= "ok" then return stopped end
+
+  local start_command = copy_table(command)
+  start_command.operation_id = operation_id
+  start_command.expected_revision = service.revision
+  return start_runtime(service, runtimes, history_directory, start_command, true)
 end
 
 local function resize_runtime(runtimes, command)
@@ -247,54 +388,81 @@ local function finish_runtime(service, runtimes, runtime_id, state, exit_code, s
     pcall(function() state.runtime:close() end)
     state.runtime = nil
   end
-  queue_runtime_event(state, {
-    type = "status", runtime_id = runtime_id, status = "exited",
-    exit_code = exit_code, signal = signal, offset = state.offset,
-  })
-  service:execute {
-    type = "runtime.update",
-    operation_id = "agent-runtime-status-" .. safe_id(runtime_id) .. "-"
-      .. tostring(service.revision + 1) .. "-" .. tostring(state.offset),
-    workspace_id = service.workspace_id,
-    expected_revision = service.revision,
-    runtime = {
-      id = runtime_id,
-      resource_id = state.resource_id,
-      status = "exited",
-      ended_at = timestamp(),
-      output_bytes = state.output_bytes,
-      output_offset = state.offset,
-      history_path = state.history_path,
-    },
-  }
+  local result = runtime_transition(service, {}, runtime_id, "exited", {
+    resource_id = state.resource_id,
+    ended_at = timestamp(),
+    output_bytes = state.output_bytes,
+    output_offset = state.offset,
+    history_path = state.history_path,
+  }, transition_operation_id(runtime_id, "exited", service.revision), service.revision)
+  if result.code == "ok" then
+    state.status = "exited"
+    queue_runtime_event(state, {
+      type = "status", runtime_id = runtime_id, status = "exited",
+      exit_code = exit_code, signal = signal, offset = state.offset,
+    })
+  else
+    state.status = "interrupted"
+  end
+end
+
+local function fail_runtime(service, runtime_id, state, message)
+  if state.runtime then
+    pcall(function() state.runtime:close() end)
+    state.runtime = nil
+  end
+  local failed = runtime_transition(service, {}, runtime_id, "failed", {
+    resource_id = state.resource_id,
+    ended_at = timestamp(),
+    output_bytes = state.output_bytes,
+    output_offset = state.offset,
+    history_path = state.history_path,
+    metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
+  }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
+  if failed.code == "ok" then
+    state.status = "failed"
+    queue_runtime_event(state, {
+      type = "status", runtime_id = runtime_id, status = "failed",
+      message = message, offset = state.offset,
+    })
+  else
+    state.status = "interrupted"
+  end
+  return failed
 end
 
 local function poll_runtimes(service, runtimes)
   for runtime_id, state in pairs(runtimes) do
     if state.runtime then
       local ok, data = pcall(function() return state.runtime:poll() end)
-      if ok and type(data) == "string" and #data > 0 then
-        local written, message = append_history(state.history_path, data)
-        if written then
-          local offset = state.offset
-          state.offset = offset + #data
-          state.output_bytes = state.offset
-          queue_runtime_event(state, {
-            type = "output", runtime_id = runtime_id,
-            offset = offset, data = data,
-          })
-        else
-          queue_runtime_event(state, {
-            type = "status", runtime_id = runtime_id, status = "error",
-            message = message, offset = state.offset,
-          })
+      if not ok then
+        fail_runtime(service, runtime_id, state, tostring(data))
+      else
+        if type(data) == "string" and #data > 0 then
+          local written, message = append_history(state.history_path, data)
+          if written then
+            local offset = state.offset
+            state.offset = offset + #data
+            state.output_bytes = state.offset
+            queue_runtime_event(state, {
+              type = "output", runtime_id = runtime_id,
+              offset = offset, data = data,
+            })
+          else
+            queue_runtime_event(state, {
+              type = "status", runtime_id = runtime_id, status = "error",
+              message = message, offset = state.offset,
+            })
+          end
         end
-      end
-      local exited_ok, exited, exit_code, signal = pcall(function()
-        return state.runtime:exited()
-      end)
-      if exited_ok and exited ~= false and exited ~= nil then
-        finish_runtime(service, runtimes, runtime_id, state, exit_code, signal)
+        local exited_ok, exited, exit_code, signal = pcall(function()
+          return state.runtime:exited()
+        end)
+        if exited_ok and exited ~= false and exited ~= nil then
+          finish_runtime(service, runtimes, runtime_id, state, exit_code, signal)
+        elseif not exited_ok then
+          fail_runtime(service, runtime_id, state, tostring(exited))
+        end
       end
     end
   end
@@ -427,12 +595,7 @@ local function handle_client_message(service, client, options, runtimes, history
     if command.type == "runtime.start" then
       result = start_runtime(service, runtimes, history_directory, command)
     elseif command.type == "runtime.restart" then
-      local restart_state = runtimes[command.runtime_id or command.resource_id]
-      if restart_state and restart_state.runtime then
-        pcall(function() restart_state.runtime:close() end)
-        restart_state.runtime = nil
-      end
-      result = start_runtime(service, runtimes, history_directory, command)
+      result = restart_runtime(service, runtimes, history_directory, command)
     elseif command.type == "runtime.stop" then
       result = stop_runtime(service, runtimes, command)
     elseif command.type == "runtime.input" then
@@ -527,6 +690,37 @@ local function flush_client(client, runtime_events)
   return true
 end
 
+local function reconcile_runtimes(service, runtimes)
+  for runtime_id, persisted in pairs(service.runtimes) do
+    local state = {
+      id = runtime_id,
+      resource_id = persisted.resource_id,
+      pending = {},
+      history_path = persisted.history_path,
+      offset = persisted.output_offset or 0,
+      output_bytes = persisted.output_bytes or 0,
+      status = persisted.status,
+    }
+    runtimes[runtime_id] = state
+
+    if persisted.status == "starting" or persisted.status == "running"
+        or persisted.status == "stopping" or persisted.status == "recovering" then
+      local previous_status = persisted.status
+      local result = runtime_transition(service, {}, runtime_id, "interrupted", {
+        resource_id = persisted.resource_id,
+        ended_at = timestamp(),
+        output_bytes = state.output_bytes,
+        output_offset = state.offset,
+        history_path = state.history_path,
+        metadata = runtime_recovery_metadata(persisted, previous_status),
+      }, transition_operation_id(runtime_id, "recovery", service.revision),
+        service.revision)
+      assert(result.code == "ok", result.message)
+      state.status = "interrupted"
+    end
+  end
+end
+
 function Agent.run(options)
   options = options or {}
   assert(type(options.endpoint) == "string", "Workbench agent endpoint is required")
@@ -547,6 +741,7 @@ function Agent.run(options)
   local history_ok, history_message = common.mkdirp(history_directory)
   assert(history_ok, history_message)
   local runtimes = {}
+  reconcile_runtimes(service, runtimes)
   local server, listen_message = transport.listen(options.endpoint)
   assert(server, listen_message)
 

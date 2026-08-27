@@ -63,7 +63,7 @@ return {
         config BLOB NOT NULL,
         status TEXT NOT NULL DEFAULT 'stopped'
           CHECK(status IN ('starting', 'running', 'stopping', 'stopped',
-                           'exited', 'interrupted', 'recovering', 'failed', 'closed')),
+                           'exited', 'interrupted', 'recovering', 'failed')),
         cols INTEGER NOT NULL DEFAULT 80 CHECK(cols BETWEEN 1 AND 1000),
         rows INTEGER NOT NULL DEFAULT 24 CHECK(rows BETWEEN 1 AND 1000),
         order_index INTEGER NOT NULL DEFAULT 0 CHECK(order_index >= 0),
@@ -83,7 +83,7 @@ return {
         resource_id TEXT,
         status TEXT NOT NULL DEFAULT 'stopped'
           CHECK(status IN ('starting', 'running', 'stopping', 'stopped',
-                           'exited', 'interrupted', 'recovering', 'failed', 'closed')),
+                           'exited', 'interrupted', 'recovering', 'failed')),
         pid INTEGER CHECK(pid IS NULL OR pid > 0),
         started_at TEXT,
         ended_at TEXT,

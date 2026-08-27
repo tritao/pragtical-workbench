@@ -145,6 +145,49 @@ test.describe("Workbench Lua service", function()
     test.equal(service:snapshot().terminals[1].status, "running")
   end)
 
+  test.test("enforces runtime lifecycle transitions", function()
+    local starting = service:execute {
+      type = "runtime.update",
+      operation_id = "runtime-starting",
+      expected_revision = 0,
+      runtime = { id = "runtime-lifecycle", status = "starting" },
+    }
+    test.equal(starting.code, "ok")
+
+    local running = service:execute {
+      type = "runtime.update",
+      operation_id = "runtime-running",
+      expected_revision = 1,
+      runtime = { id = "runtime-lifecycle", status = "running" },
+    }
+    test.equal(running.code, "ok")
+
+    local stopping = service:execute {
+      type = "runtime.update",
+      operation_id = "runtime-stopping",
+      expected_revision = 2,
+      runtime = { id = "runtime-lifecycle", status = "stopping" },
+    }
+    test.equal(stopping.code, "ok")
+
+    local stopped = service:execute {
+      type = "runtime.update",
+      operation_id = "runtime-stopped",
+      expected_revision = 3,
+      runtime = { id = "runtime-lifecycle", status = "stopped" },
+    }
+    test.equal(stopped.code, "ok")
+
+    local invalid = service:execute {
+      type = "runtime.update",
+      operation_id = "runtime-invalid",
+      expected_revision = 4,
+      runtime = { id = "runtime-lifecycle", status = "exited" },
+    }
+    test.equal(invalid.code, "invalid_runtime_transition")
+    test.equal(service:snapshot().runtimes[1].status, "stopped")
+  end)
+
   test.test("rolls back an invalid command batch and defers events", function()
     local seen = {}
     service:subscribe(function(event) seen[#seen + 1] = event end)

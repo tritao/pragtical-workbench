@@ -212,7 +212,8 @@ function Model:rebuild()
 
   section("running", "Running sessions")
   for _, terminal in ipairs(self.terminals) do
-    if terminal.status == "starting" or terminal.status == "running" then
+    if terminal.status == "starting" or terminal.status == "running"
+        or terminal.status == "stopping" or terminal.status == "recovering" then
       rows[#rows + 1] = {
         kind = "runtime",
         id = "runtime:" .. terminal.id,

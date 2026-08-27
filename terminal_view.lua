@@ -55,7 +55,8 @@ function WorkbenchTerminalView:get_name()
 end
 
 function WorkbenchTerminalView:set_status(status)
-  if self.runtime_state.status == status then
+  local lifecycle_status = status == "closed" and "stopped" or status
+  if self.runtime_state.status == lifecycle_status then
     return true
   end
   local ok, result = pcall(function()
@@ -63,13 +64,13 @@ function WorkbenchTerminalView:set_status(status)
       type = "terminal.status",
       operation_id = next_operation_id(self.terminal_id),
       terminal_id = self.terminal_id,
-      status = status
+      status = lifecycle_status
     }
   end)
   if not ok or result.code ~= "ok" then
     return false, ok and (result.message or result.code) or result
   end
-  self.runtime_state.status = status
+  self.runtime_state.status = lifecycle_status
   return true
 end
 

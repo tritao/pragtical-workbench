@@ -45,6 +45,28 @@ test.describe("Workbench agent client", function()
     test.equal(client:snapshot().revision, 1)
     test.equal(#events, 1)
     test.equal(events[1].type, "collection.created")
+
+    local resource = client:execute {
+      type = "resource.create",
+      operation_id = "agent-runtime-resource",
+      expected_revision = 1,
+      id = "agent-runtime-resource",
+      title = "Recoverable runtime",
+      kind = "terminal",
+      status = "starting",
+    }
+    test.equal(resource.code, "ok")
+    local runtime = client:execute {
+      type = "runtime.update",
+      operation_id = "agent-runtime-running",
+      expected_revision = 2,
+      runtime = {
+        id = "agent-runtime",
+        resource_id = "agent-runtime-resource",
+        status = "running",
+      },
+    }
+    test.equal(runtime.code, "ok")
   end)
 
   test.test("serves multiple clients through one authoritative service", function()

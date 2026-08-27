@@ -879,7 +879,7 @@ function Client:stop_runtime(runtime_id, options)
     type = "terminal.status",
     operation_id = next_id("runtime-stop-" .. runtime_id),
     terminal_id = runtime_id,
-    status = "closed",
+    status = "stopped",
   }
   return result.code == "ok", result
 end

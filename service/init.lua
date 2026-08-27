@@ -7,6 +7,50 @@ Service.__index = Service
 local DEFAULT_EVENT_LIMIT = 4096
 local DEFAULT_OPERATION_LIMIT = 4096
 
+local RUNTIME_STATES = {
+  starting = true,
+  running = true,
+  stopping = true,
+  stopped = true,
+  exited = true,
+  interrupted = true,
+  recovering = true,
+  failed = true,
+}
+
+local RUNTIME_TRANSITIONS = {
+  starting = { running = true, stopping = true, stopped = true,
+    interrupted = true, failed = true },
+  running = { stopping = true, exited = true, interrupted = true, failed = true },
+  stopping = { stopped = true, exited = true, interrupted = true, failed = true },
+  stopped = { starting = true, stopping = true, recovering = true },
+  exited = { starting = true, stopping = true, recovering = true },
+  interrupted = { recovering = true, starting = true, stopping = true,
+    stopped = true, failed = true },
+  recovering = { starting = true, stopping = true, stopped = true,
+    interrupted = true, failed = true },
+  failed = { recovering = true, starting = true, stopping = true, stopped = true },
+}
+
+local function valid_runtime_status(status, field)
+  if not RUNTIME_STATES[status] then
+    return nil, (field or "runtime.status") .. " is not a valid lifecycle state"
+  end
+  return true
+end
+
+local function can_transition_runtime(from, to)
+  return from == to or not from or (RUNTIME_TRANSITIONS[from] and RUNTIME_TRANSITIONS[from][to])
+end
+
+local function can_transition_resource(from, to)
+  if can_transition_runtime(from, to) then return true end
+  -- Resource projections may be updated directly by the local terminal
+  -- adapter, which can observe a process state without an agent saga.
+  return (from == "stopped" and to == "running")
+    or (from == "running" and to == "stopped")
+end
+
 local function copy(value, seen)
   if type(value) ~= "table" then return value end
   seen = seen or {}
@@ -567,6 +611,10 @@ function Service:_create_resource(command, changes)
     return nil, "collection not found: " .. tostring(value.collection_id)
   end
   local kind = value.kind or "terminal"
+  if kind == "terminal" then
+    ok, message = valid_runtime_status(value.status or "stopped", "resource.status")
+    if not ok then return nil, message end
+  end
   self.resources[id] = {
     id = id,
     kind = kind,
@@ -609,7 +657,17 @@ function Service:_update_resource(command, changes)
     resource.collection_id = value.collection_id ~= "" and value.collection_id or nil
     changed = true
   end
-  if value.status ~= nil then resource.status, changed = value.status, true end
+  if value.status ~= nil then
+    if resource.kind == "terminal" then
+      local ok, message = valid_runtime_status(value.status, "resource.status")
+      if not ok then return nil, message end
+      if not can_transition_resource(resource.status, value.status) then
+        return nil, "invalid runtime lifecycle transition: "
+          .. tostring(resource.status) .. " -> " .. tostring(value.status)
+      end
+    end
+    resource.status, changed = value.status, true
+  end
   if value.cols ~= nil then
     local ok, message = valid_field(validation.integer, value.cols, "resource.cols")
     if not ok then return nil, message end
@@ -642,6 +700,19 @@ function Service:_update_runtime(command, changes)
   if not ok then return nil, message end
 
   local runtime = self.runtimes[id] or { id = id, metadata = {} }
+  local previous_status = runtime.status
+  if value.status ~= nil then
+    ok, message = valid_runtime_status(value.status)
+    if not ok then return nil, message end
+    if not can_transition_runtime(previous_status, value.status) then
+      return nil, {
+        code = "invalid_runtime_transition",
+        message = "invalid runtime lifecycle transition: "
+          .. tostring(previous_status) .. " -> " .. tostring(value.status),
+      }
+    end
+  end
+  runtime.status = runtime.status or "stopped"
   if value.resource_id ~= nil then
     if not self.resources[value.resource_id] then
       return nil, "resource not found: " .. tostring(value.resource_id)
@@ -831,6 +902,10 @@ function Service:execute(command)
   end
 
   if not result then
+    if type(handler_message) == "table" then
+      return self:_error(handler_message.code or "invalid_command",
+        handler_message.message or tostring(handler_message), operation_id)
+    end
     return self:_error("invalid_command", handler_message, operation_id)
   end
   local committed = self:_commit(operation_id, command_digest, changes, result, checkpoint)
