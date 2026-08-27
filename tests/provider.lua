@@ -87,16 +87,18 @@ test.describe("Workbench providers", function()
       auto = true,
     }))
     test.equal(opencode.command, "opencode")
-    test.equal(opencode.args[1], "--model")
-    test.equal(opencode.args[2], "anthropic/claude-sonnet")
-    test.equal(opencode.args[3], "--auto")
-    test.equal(opencode.args[4], "--prompt")
-    test.equal(opencode.args[5], "Review this repository")
+    test.equal(#opencode.args, 0)
+    test.equal(opencode.server_url, "http://127.0.0.1:4096")
+    test.ok(opencode.manage_server)
+    test.equal(opencode.model, "anthropic/claude-sonnet")
+    test.equal(opencode.prompt, "Review this repository")
+    test.equal(opencode.execution_policy.approval, "auto")
 
     local canonical_opencode = assert(registry:runtime_spec(opencode_resource, {
       execution_policy = { approval = "auto" },
     }))
-    test.equal(canonical_opencode.args[1], "--auto")
+    test.equal(#canonical_opencode.args, 0)
+    test.equal(canonical_opencode.server_url, "http://127.0.0.1:4096")
     test.equal(canonical_opencode.execution_policy.approval, "auto")
   end)
 

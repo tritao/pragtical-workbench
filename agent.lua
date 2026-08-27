@@ -429,6 +429,11 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   end
 
   local persisted = service.runtimes[runtime_id] or {}
+  if command.external_session_id == nil and persisted.external_session_id then
+    -- A restarted agent can reattach an OpenCode session from the durable
+    -- provider metadata instead of creating a second remote session.
+    command.external_session_id = persisted.external_session_id
+  end
   local history_path = persisted.history_path
     or (history_directory .. "/" .. safe_id(runtime_id) .. ".log")
   local checkpoint_path = persisted.checkpoint_path or (history_path .. ".checkpoint")
@@ -490,6 +495,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   state.checkpoint_bytes = 0
   state.provider = resource.provider
   state.external_session_id = command.external_session_id or persisted.external_session_id
+  state.metadata = persisted.metadata or provider_metadata
   local capabilities, capability_message = service.providers:capabilities(resource, context)
   if not capabilities then
     local code, message = provider_error_message(capability_message,
@@ -630,6 +636,11 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
       output_bytes = persisted.output_bytes or persisted.newest_offset
         or persisted.output_offset or 0,
       status = persisted.status,
+      provider = persisted.provider,
+      external_session_id = persisted.external_session_id,
+      metadata = persisted.metadata,
+      capabilities = persisted.capabilities,
+      execution_policy = persisted.execution_policy,
     }
     runtimes[runtime_id] = state
   end
@@ -941,6 +952,32 @@ local function poll_runtimes(service, runtimes)
         local _, message = provider_error_message(status_message, "runtime status refresh failed")
         fail_runtime(service, runtime_id, state, message)
       else
+        local provider_changed = status.external_session_id ~= nil
+          and status.external_session_id ~= state.external_session_id
+        if provider_changed then
+          state.external_session_id = status.external_session_id
+          state.metadata = status.metadata or state.metadata
+          local persisted_result = runtime_transition(service, {}, runtime_id, state.status, {
+            resource_id = state.resource_id,
+            external_session_id = state.external_session_id,
+            metadata = state.metadata,
+            provider = state.provider,
+            capabilities = state.capabilities,
+            execution_policy = state.execution_policy,
+            output_bytes = state.output_bytes,
+            output_offset = state.offset,
+            history_path = state.history_path,
+            oldest_offset = state.oldest_offset,
+            newest_offset = state.newest_offset,
+            max_history_bytes = state.max_history_bytes,
+            checkpoint_path = state.checkpoint_path,
+            checkpoint_offset = state.checkpoint_offset,
+          }, transition_operation_id(runtime_id, "provider", service.revision),
+            service.revision)
+          if persisted_result.code ~= "ok" then
+            fail_runtime(service, runtime_id, state, persisted_result.message)
+          end
+        end
         local data = status.output
         if type(data) == "string" and #data > 0 then
           local written, message = append_history(state.history_path, state, data)
@@ -1358,6 +1395,10 @@ function Agent.run(options)
     end
 
     poll_runtimes(service, runtimes)
+    service.providers:poll {
+      workspace_id = service.workspace_id,
+      runtimes = runtimes,
+    }
     local runtime_events = queue_runtime_events(runtimes)
     for index = #clients, 1, -1 do
       local ok = flush_client(clients[index], runtime_events)

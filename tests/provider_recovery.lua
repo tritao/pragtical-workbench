@@ -1,5 +1,8 @@
 local test = require "core.test"
+local json = require "core.json"
 local ProviderRegistry = require "plugins.workbench.provider"
+local OpenCode = require "plugins.workbench.provider.builtin.opencode"
+local Http = require "plugins.workbench.provider.opencode_http"
 
 local function copy(value, seen)
   if type(value) ~= "table" then return value end
@@ -272,5 +275,168 @@ test.describe("Workbench provider recovery", function()
     test.equal(recovered.external_session_id, runtime.external_session_id)
     test.ok(restarted:shutdown({}))
     test.equal(backend.shutdowns, 1)
+  end)
+
+  test.test("drives OpenCode sessions through HTTP and SSE without a PTY", function()
+    local backend = {
+      next_session = 0,
+      sessions = {},
+      events = {},
+      requests = {},
+    }
+    local function completed(result, status)
+      return {
+        poll = function() return true, result, { status = status or 200 } end,
+        close = function() end,
+      }
+    end
+    function backend:request(method, path, body)
+      self.requests[#self.requests + 1] = { method = method, path = path, body = body }
+      if method == "GET" and path == "/global/health" then
+        return completed({ healthy = true, version = "test" })
+      end
+      if method == "POST" and path == "/session" then
+        self.next_session = self.next_session + 1
+        local id = "opencode-session-" .. tostring(self.next_session)
+        self.sessions[id] = true
+        return completed({ id = id })
+      end
+      local session_id = path:match("^/session/([^/]+)$")
+      if method == "GET" and session_id then
+        if not self.sessions[session_id] then
+          return completed({ error = "missing" }, 404)
+        end
+        return completed({ id = session_id, title = "Workbench" })
+      end
+      if method == "POST" and path:match("/prompt_async$") then
+        local id = path:match("^/session/([^/]+)/prompt_async$")
+        self.events[#self.events + 1] = {
+          event = "message.part.updated",
+          data = json.encode {
+            type = "message.part.updated",
+            properties = {
+              part = {
+                id = "part-" .. tostring(#self.events + 1),
+                type = "text",
+                sessionID = id,
+                text = body.parts[1].text,
+              },
+            },
+          },
+        }
+        return completed(nil, 204)
+      end
+      if method == "POST" and path:match("/abort$") then
+        self.aborted = true
+        return completed(true)
+      end
+      return completed({ error = "unexpected request" }, 500)
+    end
+    function backend:stream(path)
+      test.equal(path, "/event")
+      return {
+        poll = function()
+          local events = self.events
+          self.events = {}
+          return true, events
+        end,
+        close = function() end,
+      }
+    end
+
+    local registry = ProviderRegistry.new { OpenCode }
+    local resource = assert(registry:create_resource {
+      kind = "terminal",
+      provider = "builtin.opencode",
+      title = "HTTP OpenCode",
+      config = {
+        server_url = "http://test-opencode:4096",
+        manage_server = false,
+        model = "test/model",
+      },
+    })
+    local spec = assert(registry:runtime_spec(resource, {
+      execution_policy = { approval = "auto" },
+    }))
+    test.equal(spec.server_url, "http://test-opencode:4096")
+    test.ok(registry:available(resource, { opencode = backend }))
+    local runtime = assert(registry:start(resource, spec, { opencode = backend }))
+    local status = assert(registry:refresh_status(resource, runtime, { opencode = backend }))
+    test.equal(status.status, "running")
+    test.equal(status.external_session_id, "opencode-session-1")
+    test.equal(status.metadata.provider_version, OpenCode.version)
+
+    test.equal(registry:send_input(resource, runtime, "hello", {}), 5)
+    status = assert(registry:refresh_status(resource, runtime, { opencode = backend }))
+    test.contains(status.output, "hello")
+    test.equal(backend.requests[#backend.requests].path,
+      "/session/opencode-session-1/prompt_async")
+    test.equal(backend.requests[#backend.requests].body.model.providerID, "test")
+    test.equal(backend.requests[#backend.requests].body.model.modelID, "model")
+
+    local record = {
+      external_session_id = status.external_session_id,
+      metadata = status.metadata,
+    }
+    assert(registry:stop(resource, runtime, { opencode = backend }))
+    assert(registry:poll({ opencode = backend }))
+    test.ok(backend.aborted)
+
+    local recovered = assert(registry:recover(resource, record, { opencode = backend }))
+    status = assert(registry:refresh_status(resource, recovered, { opencode = backend }))
+    test.equal(status.external_session_id, "opencode-session-1")
+    test.ok(registry:shutdown({ opencode = backend }))
+  end)
+
+  test.test("handles fragmented headers and chunked OpenCode event streams", function()
+    local sse = "event: server.connected\ndata: {\"type\":\"server.connected\"}\n\n"
+    local responses = {
+      table.concat({
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n",
+        "0b\r\n{\"ok\":true}\r\n0\r\n\r\n",
+      }, ""),
+      table.concat({
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n",
+        string.format("%x\r\n%s\r\n0\r\n\r\n", #sse, sse),
+      }, ""),
+    }
+    local net = {}
+    function net.resolve_address()
+      return { get_status = function() return "success" end }
+    end
+    function net.open_tcp()
+      local response = table.remove(responses, 1)
+      local connection = { chunks = {} }
+      for index = 1, #response do connection.chunks[index] = response:sub(index, index) end
+      function connection:get_status() return "success" end
+      function connection:get_pending_writes() return 0 end
+      function connection:write(data) self.request = data return #data end
+      function connection:read()
+        return table.remove(self.chunks, 1) or ""
+      end
+      function connection:close() self.closed = true end
+      return connection
+    end
+
+    local client = Http.new { base_url = "http://test-opencode:4096", net = net }
+    local request = assert(client:request("GET", "/global/health"))
+    local ok, result
+    for _ = 1, 1000 do
+      ok, result = request:poll()
+      if ok ~= nil then break end
+    end
+    test.ok(ok)
+    test.ok(result.ok)
+
+    local stream = assert(client:stream("/event"))
+    local events
+    for _ = 1, 1000 do
+      ok, events = stream:poll()
+      if ok ~= nil and events and #events > 0 then break end
+    end
+    test.ok(ok)
+    test.equal(events[1].event, "server.connected")
   end)
 end)

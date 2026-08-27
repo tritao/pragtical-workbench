@@ -71,10 +71,11 @@ declares its resource kinds, capabilities, supported actions, and event types,
 and implements resource creation/update validation, runtime specification,
 runtime metadata, and provider metadata validation. The built-in
 `builtin.shell`, `builtin.codex`, and `builtin.opencode` providers own terminal
-resources and native PTY launch options; the generic Workbench records do not
-contain provider-specific fields. Codex and OpenCode settings such as the
-executable, model, prompt, working directory, and approval mode are
-provider-owned configuration or runtime options.
+resources; the generic Workbench records do not contain provider-specific
+fields. Codex remains a PTY-backed CLI provider. OpenCode uses its headless
+HTTP server, durable session IDs, and SSE event stream. Settings such as the
+server URL, executable, model, prompt, working directory, and approval mode
+are provider-owned configuration or runtime options.
 
 Clients can inspect the registered provider contract through
 `client:providers()` or the `providers` field in a snapshot. Provider runtime
@@ -84,10 +85,11 @@ expose resources without implicitly receiving shell/runtime behavior.
 The service-side lifecycle boundary is exposed by the provider registry:
 `available`, `create`, `attach`, `recover`, `start`, `stop`, `restart`,
 `send_input`, `action`, `refresh_status`, `capabilities`, and `shutdown`.
-The built-in shell uses this boundary for PTY creation, polling, input,
-resize, and shutdown. Its `attach` and `recover` operations explicitly report
-that native shell runtimes cannot be reattached after the agent disappears;
-the durable runtime record is instead reconciled as `interrupted`.
+The built-in shell uses this boundary for PTY creation, polling, input, resize,
+and shutdown. OpenCode uses the same boundary for server startup, session
+creation/attachment, queued prompts, abort, and event polling. Its durable
+session ID is recorded in runtime metadata so a restarted Workbench can attach
+to the existing OpenCode session instead of creating a duplicate.
 
 Runtime execution policy is provider-neutral and is stored separately from
 provider configuration. Its canonical shape is:

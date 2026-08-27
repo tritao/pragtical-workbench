@@ -234,6 +234,22 @@ function Registry:shutdown(context)
   return true
 end
 
+-- Providers may use this optional hook for bounded background work that is
+-- not tied to a currently running runtime (for example, a best-effort abort
+-- request issued while the agent is committing a stopped transition).
+function Registry:poll(context)
+  local providers = {}
+  for _, provider in pairs(self.providers) do providers[#providers + 1] = provider end
+  table.sort(providers, function(left, right) return left.id < right.id end)
+  for _, provider in ipairs(providers) do
+    if type(provider.poll) == "function" then
+      local ok, message = pcall(provider.poll, context)
+      if not ok then return failure("provider_error", provider.id .. " poll failed: " .. tostring(message)) end
+    end
+  end
+  return true
+end
+
 function Registry:create_resource(value, context)
   local provider, message = self:resolve(value.provider, value.kind or "terminal")
   if not provider then return nil, message end

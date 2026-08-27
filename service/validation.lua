@@ -137,9 +137,11 @@ local function validate_runtime_start(command)
   local limits = validation.limits
   local source = command.runtime or command
   local ok, message
-  for _, name in ipairs { "runtime_id", "resource_id", "terminal_id", "shell", "command", "term" } do
+  for _, name in ipairs { "runtime_id", "resource_id", "terminal_id", "shell", "command", "term",
+      "server_url", "server_hostname", "model", "agent", "title" } do
     ok, message = optional_string(source[name], "runtime." .. name,
-      name == "term" and limits.string or limits.path)
+      (name == "term" or name == "model" or name == "agent" or name == "title")
+        and limits.string or limits.path)
     if not ok then return nil, message end
   end
   ok, message = optional_string(source.cwd, "runtime.cwd", limits.path)
@@ -161,6 +163,16 @@ local function validate_runtime_start(command)
     limits.argument_count, function(item, item_field)
       return bounded_string(item, item_field, limits.string, true)
     end)
+  if not ok then return nil, message end
+  ok, message = validate_array(source.server_args, "runtime.server_args",
+    limits.argument_count, function(item, item_field)
+      return bounded_string(item, item_field, limits.string, true)
+    end)
+  if not ok then return nil, message end
+  if source.manage_server ~= nil and type(source.manage_server) ~= "boolean" then
+    return nil, "runtime.manage_server must be a boolean"
+  end
+  ok, message = optional_integer(source.server_port, "runtime.server_port", 1, 65535)
   if not ok then return nil, message end
   ok, message = validate_environment(source.environment, "runtime.environment")
   if not ok then return nil, message end
