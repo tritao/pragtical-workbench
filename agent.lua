@@ -384,6 +384,8 @@ local function provider_context(service, command, runtime_id)
     runtime_id = runtime_id,
     operation_id = command and command.operation_id,
     command = command,
+    resource = command and service.resources[command.resource_id or command.runtime_id
+      or command.terminal_id],
     runtime_native = runtime_native,
   }
 end

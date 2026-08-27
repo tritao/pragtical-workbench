@@ -27,6 +27,28 @@ function Runtime.attach(provider)
   provider.available = provider.available or function(_, context)
     local native, message = native_module(context)
     if not native then return false, message end
+    local command = context and context.command
+    local executable = command and (command.executable or command.command or command.shell)
+    if not executable then
+      local config = context and context.resource and context.resource.config
+      executable = config and (config.executable or config.command or config.shell)
+    end
+    executable = executable or provider.executable
+    if executable and type(native.available) == "function" then
+      local called, available, available_message = pcall(native.available, executable)
+      if not called then
+        return false, {
+          code = "provider_runtime_error",
+          message = tostring(available),
+        }
+      end
+      if not available then
+        return false, {
+          code = "provider_executable_unavailable",
+          message = available_message or ("executable is not available: " .. executable),
+        }
+      end
+    end
     return true
   end
 

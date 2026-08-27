@@ -184,6 +184,16 @@ test.describe("Workbench providers", function()
     local invalid, invalid_message = registry:refresh_status(resource, {}, {})
     test.is_nil(invalid)
     test.equal(invalid_message.code, "provider_contract")
+
+    local unavailable, unavailable_message = registry:available(resource, {
+      runtime_native = {
+        new = function() end,
+        available = function() return false, "executable is not available" end,
+      },
+      command = { executable = "missing-workbench-command" },
+    })
+    test.ok(not unavailable)
+    test.equal(unavailable_message.code, "provider_executable_unavailable")
   end)
 
   test.test("rejects unsupported provider operations and malformed resources", function()
