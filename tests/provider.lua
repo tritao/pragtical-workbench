@@ -60,6 +60,22 @@ test.describe("Workbench providers", function()
     test.equal(codex.args[4], "workspace-write")
     test.equal(codex.args[5], "Inspect this repository")
 
+    local canonical_codex = assert(registry:runtime_spec(codex_resource, {
+      execution_policy = {
+        approval = "prompt",
+        sandbox = "workspace",
+        permissions = { network = "prompt" },
+      },
+    }))
+    test.equal(canonical_codex.args[1], "-m")
+    test.equal(canonical_codex.args[2], "gpt-5")
+    test.equal(canonical_codex.args[3], "-s")
+    test.equal(canonical_codex.args[4], "workspace-write")
+    test.equal(canonical_codex.args[5], "-a")
+    test.equal(canonical_codex.args[6], "on-request")
+    test.equal(canonical_codex.execution_policy.sandbox, "workspace")
+    test.equal(canonical_codex.execution_policy.permissions.network, "prompt")
+
     local opencode_resource = assert(registry:create_resource {
       provider = "builtin.opencode",
       kind = "terminal",
@@ -76,6 +92,12 @@ test.describe("Workbench providers", function()
     test.equal(opencode.args[3], "--auto")
     test.equal(opencode.args[4], "--prompt")
     test.equal(opencode.args[5], "Review this repository")
+
+    local canonical_opencode = assert(registry:runtime_spec(opencode_resource, {
+      execution_policy = { approval = "auto" },
+    }))
+    test.equal(canonical_opencode.args[1], "--auto")
+    test.equal(canonical_opencode.execution_policy.approval, "auto")
   end)
 
   test.test("runs the shell through the provider lifecycle contract", function()
@@ -135,6 +157,15 @@ test.describe("Workbench providers", function()
     }, context))
     test.equal(calls.resized[1], 100)
     test.equal(calls.resized[2], 30)
+
+    local policy_spec = assert(registry:runtime_spec(resource, {
+      execution_policy = {
+        sandbox = "workspace",
+        permissions = { filesystem = "prompt" },
+      },
+    }))
+    test.equal(policy_spec.execution_policy.sandbox, "workspace")
+    test.equal(policy_spec.execution_policy.permissions.filesystem, "prompt")
 
     local status = assert(registry:refresh_status(resource, runtime, context))
     test.equal(status.status, "running")
@@ -213,6 +244,15 @@ test.describe("Workbench providers", function()
     }
     test.is_nil(malformed)
     test.equal(malformed_message.code, "provider_invalid_resource")
+
+    local invalid_policy, invalid_policy_message = registry:create_resource {
+      provider = "builtin.shell",
+      kind = "terminal",
+      title = "Invalid policy",
+      config = { execution_policy = { approval = "always" } },
+    }
+    test.is_nil(invalid_policy)
+    test.equal(invalid_policy_message.code, "provider_invalid_resource")
   end)
 
   test.test("service snapshots providers and validates provider metadata", function()

@@ -75,6 +75,39 @@ test.describe("Workbench protocol", function()
     test.equal(ok, false)
   end)
 
+  test.test("validates the provider-neutral execution policy", function()
+    local valid, message = Validation.command {
+      type = "runtime.start",
+      runtime_id = "runtime-policy",
+      execution_policy = {
+        approval = "prompt",
+        sandbox = "workspace",
+        permissions = {
+          filesystem = "prompt",
+          network = "deny",
+          process = "allow",
+        },
+      },
+    }
+    test.ok(valid, message)
+
+    valid, message = Validation.command {
+      type = "runtime.start",
+      runtime_id = "runtime-policy",
+      execution_policy = { approval = "always" },
+    }
+    test.is_nil(valid)
+    test.contains(message, "execution_policy.approval")
+
+    valid, message = Validation.command {
+      type = "runtime.start",
+      runtime_id = "runtime-policy",
+      execution_policy = { permissions = { unknown = "allow" } },
+    }
+    test.is_nil(valid)
+    test.contains(message, "not a supported permission")
+  end)
+
   test.test("validates event cursor messages", function()
     local frame = Protocol.encode {
       kind = "subscribe",

@@ -2,6 +2,7 @@ local function invalid(message)
   return nil, { code = "provider_invalid_resource", message = message }
 end
 
+local Policy = require "plugins.workbench.policy"
 local Runtime = require "plugins.workbench.provider.runtime"
 
 local function optional_string(value, field)
@@ -24,6 +25,90 @@ local function arguments(value, field)
   return result
 end
 
+local function copy(value)
+  if type(value) ~= "table" then return value end
+  local result = {}
+  for key, item in pairs(value) do result[key] = copy(item) end
+  return result
+end
+
+local function legacy_sandbox(value)
+  return ({
+    ["workspace-write"] = "workspace",
+    ["danger-full-access"] = "full",
+  })[value] or value
+end
+
+local function legacy_approval(value)
+  return ({
+    ["on-request"] = "prompt",
+    never = "auto",
+  })[value] or value
+end
+
+local function merge_policy(result, value)
+  for key, item in pairs(value or {}) do
+    if key == "permissions" then
+      result.permissions = result.permissions or {}
+      for permission, level in pairs(item) do
+        result.permissions[permission] = level
+      end
+    else
+      result[key] = item
+    end
+  end
+end
+
+local function effective_policy(config, command)
+  local result = {}
+  local configured, message = Policy.normalize(config.execution_policy,
+    "resource.config.execution_policy")
+  if not configured then return nil, message end
+  if configured.sandbox == nil and config.sandbox ~= nil then
+    configured.sandbox = legacy_sandbox(config.sandbox)
+  end
+  if configured.approval == nil and config.approval_policy ~= nil then
+    configured.approval = legacy_approval(config.approval_policy)
+  end
+  merge_policy(result, configured)
+
+  local requested
+  requested, message = Policy.normalize(command.execution_policy,
+    "runtime.execution_policy")
+  if not requested then return nil, message end
+  if requested.sandbox == nil and command.sandbox ~= nil then
+    requested.sandbox = legacy_sandbox(command.sandbox)
+  end
+  if requested.approval == nil and command.approval_policy ~= nil then
+    requested.approval = legacy_approval(command.approval_policy)
+  end
+  merge_policy(result, requested)
+  local normalized
+  normalized, message = Policy.normalize(result, "runtime.execution_policy")
+  if not normalized then return nil, message end
+  return normalized
+end
+
+local function map_policy(policy, spec)
+  if spec.map_policy then return spec.map_policy(policy) end
+  local result = { permissions = copy(policy.permissions) }
+  if policy.sandbox ~= nil then
+    if not spec.sandbox_flag then
+      return nil, "provider does not support execution_policy.sandbox"
+    end
+    result.sandbox = (spec.sandbox_values and spec.sandbox_values[policy.sandbox])
+      or policy.sandbox
+  end
+  if policy.approval ~= nil then
+    if not spec.approval_flag then
+      return nil, "provider does not support execution_policy.approval"
+    end
+    result.approval = (spec.approval_values and spec.approval_values[policy.approval])
+      or policy.approval
+  end
+  return result
+end
+
 local function config_error(config)
   if config == nil then config = {} end
   if type(config) ~= "table" then return invalid("resource.config must be a table") end
@@ -37,6 +122,9 @@ local function config_error(config)
   if config.auto ~= nil and type(config.auto) ~= "boolean" then
     return invalid("resource.config.auto must be a boolean")
   end
+  local ok, message = Policy.validate(config.execution_policy,
+    "resource.config.execution_policy")
+  if not ok then return invalid(message) end
   return true
 end
 
@@ -114,8 +202,12 @@ local function make(spec)
 
     local model = command.model or config.model
     local agent = command.agent or config.agent
-    local sandbox = command.sandbox or config.sandbox
-    local approval_policy = command.approval_policy or config.approval_policy
+    local execution_policy, policy_message = effective_policy(config, command)
+    if not execution_policy then return invalid(policy_message) end
+    local mapped_policy, mapped_message = map_policy(execution_policy, spec)
+    if not mapped_policy then return invalid(mapped_message) end
+    local sandbox = mapped_policy.sandbox
+    local approval_policy = mapped_policy.approval
     local profile = command.profile or config.profile
     for field, value in pairs {
       model = model, agent = agent, sandbox = sandbox,
@@ -132,7 +224,9 @@ local function make(spec)
       add_flag(args, spec.approval_flag, approval_policy)
     end
     if spec.profile_flag and profile then add_flag(args, spec.profile_flag, profile) end
-    if spec.auto_flag and (command.auto or config.auto) then add_flag(args, spec.auto_flag) end
+    if spec.auto_flag and (command.auto or config.auto or mapped_policy.auto) then
+      add_flag(args, spec.auto_flag)
+    end
 
     local prompt = command.prompt or config.prompt
     ok, message = optional_string(prompt, "runtime.prompt")
@@ -162,6 +256,7 @@ local function make(spec)
       environment = environment,
       columns = columns,
       rows = rows,
+      execution_policy = execution_policy,
       scrollback_limit = command.scrollback_limit or config.scrollback_limit or 10000,
       term = command.term or config.term or "xterm-256color",
     }
@@ -172,6 +267,7 @@ local function make(spec)
       provider = Provider.id,
       executable = spec.command,
       cwd = spec.cwd,
+      execution_policy = spec.execution_policy,
     }
   end
 

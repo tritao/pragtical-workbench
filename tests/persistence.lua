@@ -92,7 +92,11 @@ test.describe("Workbench SQLite persistence", function()
         provider = "builtin.shell",
         external_session_id = "shell-session-1",
         capabilities = { replay = true },
-        execution_policy = { approval = "prompt", sandbox = "workspace" },
+        execution_policy = {
+          approval = "prompt",
+          sandbox = "workspace",
+          permissions = { network = "prompt" },
+        },
       },
     }
     test.equal(runtime.code, "ok")
@@ -124,6 +128,7 @@ test.describe("Workbench SQLite persistence", function()
     test.equal(snapshot.runtimes[1].external_session_id, "shell-session-1")
     test.ok(snapshot.runtimes[1].capabilities.replay)
     test.equal(snapshot.runtimes[1].execution_policy.approval, "prompt")
+    test.equal(snapshot.runtimes[1].execution_policy.permissions.network, "prompt")
     test.equal(snapshot.provider_metadata[1].metadata.version, 1)
 
     local replayed = reopened:execute {

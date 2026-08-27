@@ -1,4 +1,5 @@
 local Runtime = require "plugins.workbench.provider.runtime"
+local Policy = require "plugins.workbench.policy"
 
 local Shell = {
   id = "builtin.shell",
@@ -55,6 +56,9 @@ function Shell.create_resource(value)
   end
   local ok, message = optional_table(value.config, "resource.config")
   if not ok then return nil, message end
+  ok, message = Policy.validate(value.config and value.config.execution_policy,
+    "resource.config.execution_policy")
+  if not ok then return invalid(message) end
   return {
     kind = "terminal",
     provider = Shell.id,
@@ -68,6 +72,9 @@ end
 function Shell.update_resource(_, patch)
   local ok, message = optional_table(patch.config, "resource.config")
   if not ok then return nil, message end
+  ok, message = Policy.validate(patch.config and patch.config.execution_policy,
+    "resource.config.execution_policy")
+  if not ok then return invalid(message) end
   return {}
 end
 
@@ -84,6 +91,9 @@ function Shell.runtime_spec(resource, command)
   if not ok then return nil, message end
   ok, message = optional_table(environment, "runtime.environment")
   if not ok then return nil, message end
+  local execution_policy, policy_message = Policy.merge(config.execution_policy,
+    command.execution_policy, "runtime.execution_policy")
+  if not execution_policy then return invalid(policy_message) end
 
   local columns = command.columns or command.cols or resource.cols or config.columns or 80
   local rows = command.rows or resource.rows or config.rows or 24
@@ -100,6 +110,7 @@ function Shell.runtime_spec(resource, command)
     environment = environment,
     columns = columns,
     rows = rows,
+    execution_policy = execution_policy,
     scrollback_limit = command.scrollback_limit or config.scrollback_limit or 10000,
     term = command.term or config.term or "xterm-256color",
   }

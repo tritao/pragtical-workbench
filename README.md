@@ -89,6 +89,26 @@ resize, and shutdown. Its `attach` and `recover` operations explicitly report
 that native shell runtimes cannot be reattached after the agent disappears;
 the durable runtime record is instead reconciled as `interrupted`.
 
+Runtime execution policy is provider-neutral and is stored separately from
+provider configuration. Its canonical shape is:
+
+```text
+{
+  approval = "prompt" | "auto",
+  sandbox = "read-only" | "workspace" | "full",
+  permissions = {
+    filesystem = "deny" | "prompt" | "allow",
+    network = "deny" | "prompt" | "allow",
+    process = "deny" | "prompt" | "allow"
+  }
+}
+```
+
+Providers translate this policy into their own control surface. The built-in
+Codex adapter maps the generic sandbox and approval values to its CLI flags;
+legacy `sandbox` and `approval_policy` runtime options remain accepted while
+clients migrate to `execution_policy`.
+
 ## Sidebar behavior
 
 Workbench shares Pragtical's single left sidebar slot with Files. By default,

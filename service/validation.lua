@@ -1,4 +1,5 @@
 local validation = {}
+local Policy = require "plugins.workbench.policy"
 
 -- These limits are deliberately shared by every entry point (in-process,
 -- agent, and future providers). They keep privileged runtime fields bounded
@@ -90,6 +91,12 @@ local function validate_metadata(value, field, maximum)
   return true
 end
 
+local function validate_execution_policy(value, field)
+  local ok, message = validate_metadata(value, field, validation.limits.metadata_bytes)
+  if not ok then return nil, message end
+  return Policy.validate(value, field)
+end
+
 local function validate_array(value, field, maximum, item_check)
   if value == nil then return true end
   if type(value) ~= "table" then return nil, field .. " must be an array" end
@@ -163,8 +170,8 @@ local function validate_runtime_start(command)
     if not ok then return nil, message end
   end
   if source.execution_policy ~= nil then
-    ok, message = validate_metadata(source.execution_policy,
-      "runtime.execution_policy", limits.metadata_bytes)
+    ok, message = validate_execution_policy(source.execution_policy,
+      "runtime.execution_policy")
     if not ok then return nil, message end
   end
   ok, message = optional_integer(source.scrollback_limit,
@@ -209,8 +216,8 @@ local function validate_runtime_config(config, field_name)
     field_name .. ".scrollback_limit", 1, validation.limits.scrollback_lines)
   if not ok then return nil, message end
   if config.execution_policy ~= nil then
-    ok, message = validate_metadata(config.execution_policy,
-      field_name .. ".execution_policy", validation.limits.metadata_bytes)
+    ok, message = validate_execution_policy(config.execution_policy,
+      field_name .. ".execution_policy")
     if not ok then return nil, message end
   end
   ok, message = validate_array(config.args or config.arguments, field_name .. ".args",
@@ -325,8 +332,12 @@ local function validate_command_fields(command)
     end
     for _, name in ipairs { "capabilities", "execution_policy" } do
       if source[name] ~= nil then
-        ok, message = validate_metadata(source[name], "runtime." .. name,
-          limits.metadata_bytes)
+        if name == "execution_policy" then
+          ok, message = validate_execution_policy(source[name], "runtime." .. name)
+        else
+          ok, message = validate_metadata(source[name], "runtime." .. name,
+            limits.metadata_bytes)
+        end
         if not ok then return nil, message end
       end
     end

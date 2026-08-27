@@ -497,7 +497,8 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     return service_error(service, command, code, message)
   end
   state.capabilities = capabilities
-  state.execution_policy = command.execution_policy or configured.execution_policy or {}
+  state.execution_policy = options.execution_policy
+    or command.execution_policy or configured.execution_policy or {}
   if terminal_emulator then
     local emulator_ok, emulator = pcall(terminal_emulator.new, {
       columns = options.columns,
