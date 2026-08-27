@@ -15,7 +15,7 @@ local startup_values = {
 }
 
 config.plugins.workbench = common.merge({
-  backend = "in_process",
+  backend = "agent",
   workspace = "default",
   storage_path = nil,
   size = 240 * SCALE,

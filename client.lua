@@ -6,6 +6,7 @@ local Protocol = require "plugins.workbench.service.protocol"
 
 local next_operation = 0
 local services = {}
+local agent_processes = {}
 
 local Client = {}
 Client.__index = Client
@@ -15,9 +16,100 @@ local function next_id(prefix)
   return prefix .. "-" .. tostring(next_operation)
 end
 
-local function default_storage_path()
+local function safe_path_component(value)
+  local component = tostring(value or "default"):gsub("[^%w_.-]", "_")
+  return component ~= "" and component or "default"
+end
+
+local function path_directory(path, fallback)
+  return path and path:match("^(.+)[/\\][^/\\]+$") or fallback
+end
+
+local function default_storage_path(workspace_id)
   if type(USERDIR) ~= "string" then return nil end
-  return USERDIR .. PATHSEP .. "workbench.sqlite3"
+  return USERDIR .. PATHSEP .. "workbench" .. PATHSEP
+    .. safe_path_component(workspace_id) .. PATHSEP .. "workbench.sqlite3"
+end
+
+local function file_exists(path)
+  local info = path and system.get_file_info(path)
+  return info and info.type == "file"
+end
+
+local function agent_executable()
+  local suffix = PLATFORM == "Windows" and ".exe" or ""
+  local candidates = {}
+  if type(PRAGTICAL_PROJECT_BUILD_DIR) == "string"
+      and PRAGTICAL_PROJECT_BUILD_DIR ~= "" then
+    candidates[#candidates + 1] = PRAGTICAL_PROJECT_BUILD_DIR .. PATHSEP
+      .. "src" .. PATHSEP .. "workbench-agent" .. suffix
+  end
+  if type(EXEDIR) == "string" then
+    candidates[#candidates + 1] = EXEDIR .. PATHSEP .. "workbench-agent" .. suffix
+  end
+  for _, path in ipairs(candidates) do
+    if file_exists(path) then return path end
+  end
+  return nil
+end
+
+local function connect_endpoint(endpoint)
+  local ok, connection, message = pcall(transport.connect, endpoint)
+  if not ok then return nil, connection end
+  if connection then return connection end
+  return nil, message or "Workbench agent is not listening"
+end
+
+local function start_agent(options, endpoint, data_dir, storage_path, workspace_id)
+  local current = agent_processes[endpoint]
+  if current then
+    local ok, running = pcall(function() return current:running() end)
+    if ok and running then return true end
+    agent_processes[endpoint] = nil
+  end
+
+  local executable = options.agent_executable or agent_executable()
+  if not executable then
+    return nil, "Workbench agent executable was not found"
+  end
+  local ok, process_handle, message = pcall(process.start, {
+    executable,
+    "--data-root", DATADIR,
+    "--data-dir", data_dir,
+    "--endpoint", endpoint,
+    "--storage-path", storage_path,
+    "--workspace", workspace_id,
+  }, {
+    detach = true,
+    stdin = process.REDIRECT_DISCARD,
+    stdout = process.REDIRECT_DISCARD,
+    stderr = process.REDIRECT_DISCARD,
+  })
+  if not ok then return nil, process_handle end
+  if not process_handle then
+    return nil, message or "Unable to start Workbench agent"
+  end
+  agent_processes[endpoint] = process_handle
+  return true
+end
+
+local function connect_or_start_agent(options, endpoint, data_dir, storage_path, workspace_id)
+  local connection, message = connect_endpoint(endpoint)
+  if connection then return connection end
+
+  local started, start_message = start_agent(options, endpoint, data_dir, storage_path,
+    workspace_id)
+  if not started then
+    return nil, start_message or message
+  end
+
+  local deadline = system.get_time() + (options.start_timeout or 2)
+  repeat
+    system.sleep(0.02)
+    connection, message = connect_endpoint(endpoint)
+    if connection then return connection end
+  until system.get_time() >= deadline
+  return nil, message or "Timed out waiting for Workbench agent"
 end
 
 local function copy_command(client, command)
@@ -138,13 +230,13 @@ end
 
 function Client.open(options)
   options = options or {}
-  local backend = options.backend or "fake"
+  local backend = options.backend or "agent"
   local workspace_id = options.workspace_id or options.workspace or "default"
 
   if backend == "fake" or backend == "in_process" then
     local storage_path = options.storage_path
-    if backend == "in_process" and storage_path == nil then
-      storage_path = default_storage_path()
+    if backend == "in_process" and storage_path ~= nil then
+      return nil, "persistent in-process Workbench backends are disabled; use the agent"
     end
     local key = workspace_id .. "\0" .. tostring(storage_path or "memory")
     local entry = services[key]
@@ -184,17 +276,23 @@ function Client.open(options)
     if not transport_available then
       return nil, "Workbench agent transport is disabled"
     end
-    local endpoint = options.endpoint
-    if type(endpoint) ~= "string" or endpoint == "" then
-      return nil, "Workbench agent endpoint is required"
+    local storage_path = options.storage_path or default_storage_path(workspace_id)
+    if type(storage_path) ~= "string" or storage_path == "" then
+      return nil, "Workbench agent storage path is unavailable"
     end
-    local connected, connection = pcall(transport.connect, endpoint)
-    if not connected then return nil, connection end
-    if not connection then return nil, "Unable to connect to Workbench agent" end
+    local data_dir = options.data_dir or path_directory(storage_path, USERDIR or ".")
+    local endpoint = options.endpoint or (data_dir .. PATHSEP .. "workbench.sock")
+    local connection, connect_message = connect_or_start_agent(options, endpoint,
+      data_dir, storage_path, workspace_id)
+    if not connection then
+      return nil, connect_message or "Unable to connect to Workbench agent"
+    end
     local client = setmetatable({
       connection = connection,
       backend = backend,
       workspace_id = workspace_id,
+      storage_path = storage_path,
+      endpoint = endpoint,
       closed = false,
       agent_callbacks = {},
       agent_event_offset = 0,

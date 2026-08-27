@@ -74,16 +74,17 @@ function Sidebar:new(options)
 end
 
 function Sidebar.from_state(state)
-  return Sidebar(state or {})
+  state = state or {}
+  return Sidebar {
+    workspace_id = state.workspace_id,
+    selected_id = state.selected_id,
+    expanded = state.expanded,
+  }
 end
 
 function Sidebar:get_state()
   return {
-    backend = self.client and self.client.backend
-      or config.plugins.workbench.backend,
     workspace_id = self.model.workspace_id,
-    storage_path = self.client and self.client.storage_path
-      or config.plugins.workbench.storage_path,
     selected_id = self.selected_id,
     expanded = self.model.expanded
   }
