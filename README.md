@@ -35,7 +35,8 @@ workbench-agent --data-root /path/to/pragtical/data \
 ```
 
 The client selects it with `backend = "agent"` and the same `endpoint`.
-The current agent vertical slice supports SQLite-backed workspace commands,
+The agent is a single Lua authority serving multiple clients. Its current
+vertical slice supports SQLite-backed workspace commands,
 snapshots, event subscriptions, replay recovery, reconnect, POSIX PTY ownership,
 bounded output queues, byte-offset history, input, resize, and terminal replay.
 ConPTY and Windows named-pipe transport support are now implemented in the

@@ -46,4 +46,49 @@ test.describe("Workbench agent client", function()
     test.equal(#events, 1)
     test.equal(events[1].type, "collection.created")
   end)
+
+  test.test("serves multiple clients through one authoritative service", function()
+    local second = assert(Client.open {
+      backend = "agent",
+      endpoint = endpoint,
+      workspace_id = "agent-test",
+    })
+    local first_events, second_events = {}, {}
+    assert(client:on_event(function(event) first_events[#first_events + 1] = event end))
+    assert(second:on_event(function(event) second_events[#second_events + 1] = event end))
+    local first_result, second_result
+    local first_request = assert(client:execute({
+      type = "collection.create",
+      id = "agent-multi-first",
+      title = "First concurrent collection",
+    }, function(result) first_result = result end))
+    local second_request = assert(second:execute({
+      type = "collection.create",
+      id = "agent-multi-second",
+      title = "Second concurrent collection",
+    }, function(result) second_result = result end))
+
+    local deadline = system.get_time() + 2
+    while (not first_request:is_done() or not second_request:is_done())
+        and system.get_time() < deadline do
+      client:poll()
+      second:poll()
+      if not first_request:is_done() or not second_request:is_done() then
+        system.sleep(0.01)
+      end
+    end
+
+    test.ok(first_request:is_done())
+    test.ok(second_request:is_done())
+    test.ok(first_result and second_result)
+    local successful = (first_result.code == "ok" and 1 or 0)
+      + (second_result.code == "ok" and 1 or 0)
+    test.equal(successful, 1)
+    local conflicts = (first_result.code == "revision_conflict" and 1 or 0)
+      + (second_result.code == "revision_conflict" and 1 or 0)
+    test.equal(conflicts, 1)
+    test.equal(#first_events, 1)
+    test.equal(#second_events, 1)
+    second:close()
+  end)
 end)

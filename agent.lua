@@ -7,10 +7,6 @@ local runtime_native = require "workbench_runtime"
 
 local Agent = {}
 
-local function send(connection, message)
-  return connection:send(Protocol.encode(message))
-end
-
 local function error_message(request_id, code, message)
   return Protocol.request("error", request_id, {
     error = { code = code, message = message },
@@ -304,167 +300,198 @@ local function poll_runtimes(service, runtimes)
   end
 end
 
-local function event_message(item)
+local MAX_MESSAGES_PER_CLIENT = 64
+local MAX_OUTBOUND_MESSAGES = 1024
+local MAX_OUTBOUND_BYTES = 8 * 1024 * 1024
+
+local function event_message(event)
   return Protocol.request("event", nil, {
-    event = item.event,
-    event_sequence = item.event.event_sequence,
+    event = event,
+    event_sequence = event.event_sequence,
   })
 end
 
-local function run_client(service, connection, options, runtimes, history_directory)
+local function new_client(connection)
+  return {
+    connection = connection,
+    subscribed = false,
+    pending_events = {},
+    outgoing = {},
+    outgoing_bytes = 0,
+  }
+end
+
+local function enqueue(client, message)
+  local ok, frame = pcall(Protocol.encode, message)
+  if not ok then return nil, frame end
+  if #client.outgoing >= MAX_OUTBOUND_MESSAGES
+      or client.outgoing_bytes + #frame > MAX_OUTBOUND_BYTES then
+    return nil, "Workbench client outbound queue limit exceeded"
+  end
+  client.outgoing[#client.outgoing + 1] = frame
+  client.outgoing_bytes = client.outgoing_bytes + #frame
+  return true
+end
+
+local function close_client(client)
+  if client.unsubscribe then client.unsubscribe() end
+  client.unsubscribe = nil
+  client.closed = true
+  pcall(function() client.connection:close() end)
+end
+
+local function queue_runtime_events(runtimes)
+  local events = {}
+  for _, state in pairs(runtimes) do
+    while #state.pending > 0 do
+      events[#events + 1] = table.remove(state.pending, 1)
+    end
+  end
+  return events
+end
+
+local function handle_client_message(service, client, options, runtimes, history_directory,
+    message)
   local workspace_id = service.workspace_id
-  local subscribed = false
-  local pending_events = {}
-  local unsubscribe
+  if message.kind == "close" then return false end
 
-  local function queue_event(event)
-    if subscribed then
-      pending_events[#pending_events + 1] = {
-        event = event,
-      }
+  if message.kind == "hello" then
+    if message.workspace_id and message.workspace_id ~= workspace_id then
+      return enqueue(client, error_message(message.request_id, "workspace_mismatch",
+        "requested workspace does not match the agent workspace"))
     end
-  end
-
-  local function flush_events()
-    while #pending_events > 0 do
-      local item = table.remove(pending_events, 1)
-      local ok, message = send(connection, event_message(item))
-      if not ok then return nil, message end
-    end
-    for _, state in pairs(runtimes) do
-      while #state.pending > 0 do
-        local event = table.remove(state.pending, 1)
-        local ok, message = send(connection, Protocol.request("event", nil, {
-          event = event, offset = event.offset,
-        }))
-        if not ok then return nil, message end
+    return enqueue(client, Protocol.request("hello_result", message.request_id, {
+      ok = true,
+      workspace_id = workspace_id,
+      revision = service.revision,
+      capabilities = {
+        event_replay = true,
+        event_cursors = true,
+        sqlite = true,
+        runtimes = true,
+        runtime_replay = true,
+      },
+    }))
+  elseif message.kind == "snapshot" then
+    return enqueue(client, Protocol.request("snapshot", message.request_id, {
+      snapshot = service:snapshot(),
+    }))
+  elseif message.kind == "subscribe" then
+    if client.unsubscribe then client.unsubscribe() end
+    client.subscribed = true
+    client.unsubscribe = service:subscribe(function(event)
+      if client.subscribed and not client.closed then
+        client.pending_events[#client.pending_events + 1] = event
       end
-    end
-    return true
-  end
-
-  local function tick()
-    poll_runtimes(service, runtimes)
-    return flush_events()
-  end
-
-  while true do
-    local frame, receive_message = connection:receive(50)
-    if not frame then
-      if receive_message == "timeout" then
-        local ok, message = tick()
-        if not ok then return nil, message end
-      else
-        return true
+    end)
+    local events, replay_error = service:get_events(message.after_event_sequence or 0)
+    if events then
+      for _, event in ipairs(events) do
+        local ok, send_message = enqueue(client, event_message(event))
+        if not ok then return nil, send_message end
       end
     else
-      local message, decode_message = Protocol.decode(frame)
-      if not message then
-        send(connection, error_message(nil, "invalid_protocol", decode_message))
-      elseif message.kind == "close" then
-        break
-      elseif message.kind == "hello" then
-        if message.workspace_id and message.workspace_id ~= workspace_id then
-          send(connection, error_message(message.request_id, "workspace_mismatch",
-            "requested workspace does not match the agent workspace"))
-        else
-          send(connection, Protocol.request("hello_result", message.request_id, {
-            ok = true,
-            workspace_id = workspace_id,
-            revision = service.revision,
-            capabilities = {
-              event_replay = true,
-              event_cursors = true,
-              sqlite = true,
-              runtimes = true,
-              runtime_replay = true,
-            },
-          }))
-        end
-      elseif message.kind == "snapshot" then
-        send(connection, Protocol.request("snapshot", message.request_id, {
-          snapshot = service:snapshot(),
-        }))
-      elseif message.kind == "subscribe" then
-        if unsubscribe then unsubscribe() end
-        subscribed = true
-        unsubscribe = service:subscribe(queue_event)
-        local events, replay_error = service:get_events(message.after_event_sequence or 0)
-        if events then
-          for _, event in ipairs(events) do
-            local ok, send_message = send(connection, Protocol.request("event", nil, {
-              event = event,
-              event_sequence = event.event_sequence,
-            }))
-            if not ok then return nil, send_message end
-          end
-        else
-          local ok, send_message = send(connection, Protocol.request("snapshot", message.request_id, {
-            reason = replay_error,
-            snapshot = service:snapshot(),
-          }))
-          if not ok then return nil, send_message end
-        end
-        local ok, send_message = send(connection, Protocol.request("subscribed", message.request_id, {
-          revision = service.revision,
-          event_cursor = service.event_sequence,
-        }))
-        if not ok then return nil, send_message end
-      elseif message.kind == "batch" then
-        if type(message.commands) ~= "table" then
-          send(connection, error_message(message.request_id, "invalid_command", "commands are required"))
-        else
-          local result = service:execute_batch(message.commands)
-          local ok, send_message = send(connection, Protocol.request("result", message.request_id, {
-            result = result,
-          }))
-          if not ok then return nil, send_message end
-          local flushed, flush_message = tick()
-          if not flushed then return nil, flush_message end
-        end
-      elseif message.kind == "command" then
-        if type(message.command) ~= "table" then
-          send(connection, error_message(message.request_id, "invalid_command", "command is required"))
-        else
-          local command = message.command
-          local result
-          if command.type == "runtime.start" then
-            result = start_runtime(service, runtimes, history_directory, command)
-          elseif command.type == "runtime.restart" then
-            local restart_state = runtimes[command.runtime_id or command.resource_id]
-            if restart_state and restart_state.runtime then
-              pcall(function() restart_state.runtime:close() end)
-              restart_state.runtime = nil
-            end
-            result = start_runtime(service, runtimes, history_directory, command)
-          elseif command.type == "runtime.stop" then
-            result = stop_runtime(service, runtimes, command)
-          elseif command.type == "runtime.input" then
-            result = input_runtime(runtimes, command)
-          elseif command.type == "runtime.resize" then
-            result = resize_runtime(runtimes, command)
-          elseif command.type == "runtime.replay" then
-            result = replay_runtime(service, runtimes, command)
-          else
-            result = service:execute(command)
-          end
-          local ok, send_message = send(connection, Protocol.request("result", message.request_id, {
-            result = result,
-          }))
-          if not ok then return nil, send_message end
-          local flushed, flush_message = tick()
-          if not flushed then return nil, flush_message end
-        end
-      else
-        send(connection, error_message(message.request_id, "unsupported_message",
-          "message is not valid in the current agent session"))
-      end
-      local flushed, flush_message = tick()
-      if not flushed then return nil, flush_message end
+      local ok, send_message = enqueue(client, Protocol.request("snapshot", message.request_id, {
+        reason = replay_error,
+        snapshot = service:snapshot(),
+      }))
+      if not ok then return nil, send_message end
     end
+    return enqueue(client, Protocol.request("subscribed", message.request_id, {
+      revision = service.revision,
+      event_cursor = service.event_sequence,
+    }))
+  elseif message.kind == "batch" then
+    if type(message.commands) ~= "table" then
+      return enqueue(client, error_message(message.request_id, "invalid_command",
+        "commands are required"))
+    end
+    local result = service:execute_batch(message.commands)
+    return enqueue(client, Protocol.request("result", message.request_id, {
+      result = result,
+    }))
+  elseif message.kind == "command" then
+    if type(message.command) ~= "table" then
+      return enqueue(client, error_message(message.request_id, "invalid_command",
+        "command is required"))
+    end
+    local command = message.command
+    local result
+    if command.type == "runtime.start" then
+      result = start_runtime(service, runtimes, history_directory, command)
+    elseif command.type == "runtime.restart" then
+      local restart_state = runtimes[command.runtime_id or command.resource_id]
+      if restart_state and restart_state.runtime then
+        pcall(function() restart_state.runtime:close() end)
+        restart_state.runtime = nil
+      end
+      result = start_runtime(service, runtimes, history_directory, command)
+    elseif command.type == "runtime.stop" then
+      result = stop_runtime(service, runtimes, command)
+    elseif command.type == "runtime.input" then
+      result = input_runtime(runtimes, command)
+    elseif command.type == "runtime.resize" then
+      result = resize_runtime(runtimes, command)
+    elseif command.type == "runtime.replay" then
+      result = replay_runtime(service, runtimes, command)
+    else
+      result = service:execute(command)
+    end
+    return enqueue(client, Protocol.request("result", message.request_id, {
+      result = result,
+    }))
   end
 
-  if unsubscribe then unsubscribe() end
+  return enqueue(client, error_message(message.request_id, "unsupported_message",
+    "message is not valid in the current agent session"))
+end
+
+local function process_client(service, client, options, runtimes, history_directory)
+  for _ = 1, MAX_MESSAGES_PER_CLIENT do
+    local received, frame, receive_message = pcall(function()
+      return client.connection:receive(0)
+    end)
+    if not received then return nil, frame end
+    if not frame then
+      if receive_message == "timeout" then return true end
+      return nil, receive_message or "Workbench client disconnected"
+    end
+
+    local message, decode_message = Protocol.decode(frame)
+    if not message then
+      local ok, error_result = enqueue(client,
+        error_message(nil, "invalid_protocol", decode_message))
+      if not ok then return nil, error_result end
+    else
+      local ok, message_error = handle_client_message(service, client, options, runtimes,
+        history_directory, message)
+      if not ok then return nil, message_error or "client requested close" end
+    end
+  end
+  return true
+end
+
+local function flush_client(client, runtime_events)
+  while #client.pending_events > 0 do
+    local event = table.remove(client.pending_events, 1)
+    local ok, message = enqueue(client, event_message(event))
+    if not ok then return nil, message end
+  end
+  for _, event in ipairs(runtime_events) do
+    local ok, message = enqueue(client, Protocol.request("event", nil, {
+      event = event, offset = event.offset,
+    }))
+    if not ok then return nil, message end
+  end
+  while #client.outgoing > 0 do
+    local frame = table.remove(client.outgoing, 1)
+    client.outgoing_bytes = client.outgoing_bytes - #frame
+    local sent_ok, send_ok, send_message = pcall(function()
+      return client.connection:send(frame)
+    end)
+    if not sent_ok then return nil, send_ok end
+    if send_ok == false then return nil, send_message or "client send failed" end
+  end
   return true
 end
 
@@ -492,20 +519,61 @@ function Agent.run(options)
   assert(server, listen_message)
 
   local served = false
+  local clients = {}
+
+  local function add_client(connection)
+    served = true
+    clients[#clients + 1] = new_client(connection)
+  end
+
+  local function remove_client(index)
+    close_client(clients[index])
+    table.remove(clients, index)
+  end
+
   while true do
-    local connection, accept_message = server:accept(options.once and -1 or 50)
-    if connection then
-      served = true
-      run_client(service, connection, options, runtimes, history_directory)
-      connection:close()
-      if options.once then break end
-    elseif accept_message == "timeout" then
-      poll_runtimes(service, runtimes)
-    else
-      server:close()
-      service:close()
-      error(accept_message)
+    if not (options.once and served) then
+      local connection, accept_message = server:accept(options.once and -1 or 10)
+      if connection then
+        add_client(connection)
+      elseif accept_message == "timeout" then
+        -- The shared event loop continues servicing existing clients below.
+      else
+        server:close()
+        service:close()
+        error(accept_message)
+      end
     end
+
+    if not options.once then
+      while true do
+        local extra, extra_message = server:accept(0)
+        if extra then
+          add_client(extra)
+        elseif extra_message == "timeout" then
+          break
+        else
+          server:close()
+          service:close()
+          error(extra_message)
+        end
+      end
+    end
+
+    for index = #clients, 1, -1 do
+      local client = clients[index]
+      local ok = process_client(service, client, options, runtimes, history_directory)
+      if not ok then remove_client(index) end
+    end
+
+    poll_runtimes(service, runtimes)
+    local runtime_events = queue_runtime_events(runtimes)
+    for index = #clients, 1, -1 do
+      local ok = flush_client(clients[index], runtime_events)
+      if not ok then remove_client(index) end
+    end
+
+    if options.once and served and #clients == 0 then break end
   end
 
   server:close()

@@ -13,7 +13,7 @@ test.describe("Workbench agent reconnect", function()
       workspace_id = "agent-test",
     })
     local snapshot = client:snapshot()
-    test.equal(snapshot.revision, 1)
+    test.equal(snapshot.revision, 2)
     test.equal(snapshot.collections[1].id, "agent-collection")
     client:close()
   end)
