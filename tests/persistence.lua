@@ -179,6 +179,55 @@ test.describe("Workbench SQLite persistence", function()
     os.remove(path)
   end)
 
+  test.test("persists only records in the command write-set", function()
+    local path = os.tmpname()
+    os.remove(path)
+    local workspace_id = new_workspace_id()
+    local store = assert(Storage.new(path))
+    local service = Service.new { workspace_id = workspace_id, store = store }
+
+    test.equal(service:execute {
+      type = "collection.create",
+      operation_id = "write-set-first",
+      expected_revision = 0,
+      id = "write-set-first",
+      title = "First",
+    }.code, "ok")
+    local first_row = assert(store.db:query([[
+      SELECT rowid FROM collections WHERE workspace_id = ? AND id = ?
+    ]], { workspace_id, "write-set-first" }))[1].rowid
+
+    test.equal(service:execute {
+      type = "collection.create",
+      operation_id = "write-set-second",
+      expected_revision = 1,
+      id = "write-set-second",
+      title = "Second",
+    }.code, "ok")
+    local unchanged_row = assert(store.db:query([[
+      SELECT rowid FROM collections WHERE workspace_id = ? AND id = ?
+    ]], { workspace_id, "write-set-first" }))[1].rowid
+    test.equal(unchanged_row, first_row)
+
+    local deleted = service:execute {
+      type = "collection.delete",
+      operation_id = "write-set-delete",
+      expected_revision = 2,
+      id = "write-set-second",
+    }
+    test.equal(deleted.code, "ok")
+    test.equal(assert(store.db:query([[
+      SELECT COUNT(*) AS count FROM collections
+       WHERE workspace_id = ? AND id = ?
+    ]], { workspace_id, "write-set-second" }))[1].count, 0)
+    test.equal(assert(store.db:query([[
+      SELECT rowid FROM collections WHERE workspace_id = ? AND id = ?
+    ]], { workspace_id, "write-set-first" }))[1].rowid, first_row)
+
+    service:close()
+    os.remove(path)
+  end)
+
   test.test("bounds persisted operation idempotency records", function()
     local path = os.tmpname()
     os.remove(path)

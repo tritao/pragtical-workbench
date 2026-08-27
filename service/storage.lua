@@ -228,74 +228,130 @@ function Storage:load(workspace_id)
   }
 end
 
-local function save_collections(db, workspace_id, records)
-  for _, record in pairs(records) do
+local function apply_collections(db, workspace_id, changes, mode)
+  if mode ~= "delete" then for _, record in ipairs(changes.upsert) do
     execute(db, [[
       INSERT INTO collections(workspace_id, id, parent_id, title, order_index, archived)
       VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id, id) DO UPDATE SET
+        parent_id = excluded.parent_id,
+        title = excluded.title,
+        order_index = excluded.order_index,
+        archived = excluded.archived
     ]], {
       workspace_id, record.id, record.parent_id ~= "root" and record.parent_id or nil,
       record.title, record.order or 0, record.archived and 1 or 0
     })
-  end
+  end end
+  if mode ~= "upsert" then for _, id in ipairs(changes.delete) do
+    execute(db, "DELETE FROM collections WHERE workspace_id = ? AND id = ?",
+      { workspace_id, id })
+  end end
 end
 
-local function save_tasks(db, workspace_id, records)
-  for _, record in pairs(records) do
+local function apply_tasks(db, workspace_id, changes, mode)
+  if mode ~= "delete" then for _, record in ipairs(changes.upsert) do
     execute(db, [[
       INSERT INTO tasks(workspace_id, id, collection_id, title, status, order_index, archived)
       VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id, id) DO UPDATE SET
+        collection_id = excluded.collection_id,
+        title = excluded.title,
+        status = excluded.status,
+        order_index = excluded.order_index,
+        archived = excluded.archived
     ]], {
       workspace_id, record.id, record.collection_id, record.title, record.status,
       record.order or 0, record.archived and 1 or 0
     })
-  end
+  end end
+  if mode ~= "upsert" then for _, id in ipairs(changes.delete) do
+    execute(db, "DELETE FROM tasks WHERE workspace_id = ? AND id = ?",
+      { workspace_id, id })
+  end end
 end
 
-local function save_resources(db, workspace_id, records)
-  for _, record in pairs(records) do
+local function apply_resources(db, workspace_id, changes, mode)
+  if mode ~= "delete" then for _, record in ipairs(changes.upsert) do
     execute(db, [[
       INSERT INTO resources(
         workspace_id, id, kind, provider, title, collection_id, config, status,
         cols, rows, order_index, archived
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id, id) DO UPDATE SET
+        kind = excluded.kind,
+        provider = excluded.provider,
+        title = excluded.title,
+        collection_id = excluded.collection_id,
+        config = excluded.config,
+        status = excluded.status,
+        cols = excluded.cols,
+        rows = excluded.rows,
+        order_index = excluded.order_index,
+        archived = excluded.archived
     ]], {
       workspace_id, record.id, record.kind, record.provider, record.title,
-      record.collection_id, encode(record.config or {}), record.status,
+      record.collection_id, encode(record.config or {}), record.status or "stopped",
       record.cols or 80, record.rows or 24, record.order or 0,
       record.archived and 1 or 0
     })
-  end
+  end end
+  if mode ~= "upsert" then for _, id in ipairs(changes.delete) do
+    execute(db, "DELETE FROM resources WHERE workspace_id = ? AND id = ?",
+      { workspace_id, id })
+  end end
 end
 
-local function save_runtimes(db, workspace_id, records)
-  for _, record in pairs(records) do
+local function apply_runtimes(db, workspace_id, changes, mode)
+  if mode ~= "delete" then for _, record in ipairs(changes.upsert) do
     execute(db, [[
       INSERT INTO runtimes(
         workspace_id, id, resource_id, status, pid, started_at, ended_at,
         output_bytes, output_offset, history_path, metadata
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id, id) DO UPDATE SET
+        resource_id = excluded.resource_id,
+        status = excluded.status,
+        pid = excluded.pid,
+        started_at = excluded.started_at,
+        ended_at = excluded.ended_at,
+        output_bytes = excluded.output_bytes,
+        output_offset = excluded.output_offset,
+        history_path = excluded.history_path,
+        metadata = excluded.metadata
     ]], {
       workspace_id, record.id, record.resource_id, record.status or "stopped", record.pid,
       record.started_at, record.ended_at, record.output_bytes or 0,
       record.output_offset or 0, record.history_path, encode(record.metadata or {}),
     })
-  end
+  end end
+  if mode ~= "upsert" then for _, id in ipairs(changes.delete) do
+    execute(db, "DELETE FROM runtimes WHERE workspace_id = ? AND id = ?",
+      { workspace_id, id })
+  end end
 end
 
-local function save_provider_metadata(db, workspace_id, records)
-  for _, record in pairs(records) do
+local function apply_provider_metadata(db, workspace_id, changes, mode)
+  if mode ~= "delete" then for _, record in ipairs(changes.upsert) do
     execute(db, [[
       INSERT INTO provider_metadata(workspace_id, provider_id, metadata)
       VALUES (?, ?, ?)
+      ON CONFLICT(workspace_id, provider_id) DO UPDATE SET
+        metadata = excluded.metadata,
+        updated_at = CURRENT_TIMESTAMP
     ]], {
       workspace_id, record.provider_id, encode(record.metadata or {})
     })
-  end
+  end end
+  if mode ~= "upsert" then for _, id in ipairs(changes.delete) do
+    execute(db, [[
+      DELETE FROM provider_metadata WHERE workspace_id = ? AND provider_id = ?
+    ]], { workspace_id, id })
+  end end
 end
 
 function Storage:commit(service, operation_id, result, events, command_digest,
-    expected_previous_revision)
+    expected_previous_revision, write_set)
   local own_transaction = not self.in_transaction
   local ok, message = pcall(function()
     if own_transaction then transaction(self.db, "begin", "immediate") end
@@ -339,19 +395,19 @@ function Storage:commit(service, operation_id, result, events, command_digest,
       }
     end
 
-    -- Clear in dependency order. The model is rewritten in one deferred
-    -- transaction, so foreign keys still protect the final graph without
-    -- allowing a composite SET NULL action to erase workspace ownership.
-    execute(self.db, "DELETE FROM runtimes WHERE workspace_id = ?", { service.workspace_id })
-    execute(self.db, "DELETE FROM resources WHERE workspace_id = ?", { service.workspace_id })
-    execute(self.db, "DELETE FROM tasks WHERE workspace_id = ?", { service.workspace_id })
-    execute(self.db, "DELETE FROM collections WHERE workspace_id = ?", { service.workspace_id })
-    execute(self.db, "DELETE FROM provider_metadata WHERE workspace_id = ?", { service.workspace_id })
-    save_collections(self.db, service.workspace_id, service.collections)
-    save_tasks(self.db, service.workspace_id, service.tasks)
-    save_resources(self.db, service.workspace_id, service.resources)
-    save_runtimes(self.db, service.workspace_id, service.runtimes)
-    save_provider_metadata(self.db, service.workspace_id, service.provider_metadata)
+    if not write_set then error "database write-set is required" end
+    -- Apply all upserts before deletes so deferred relationships can be
+    -- repaired atomically when a parent or resource is removed.
+    apply_collections(self.db, service.workspace_id, write_set.collections, "upsert")
+    apply_tasks(self.db, service.workspace_id, write_set.tasks, "upsert")
+    apply_resources(self.db, service.workspace_id, write_set.resources, "upsert")
+    apply_runtimes(self.db, service.workspace_id, write_set.runtimes, "upsert")
+    apply_provider_metadata(self.db, service.workspace_id, write_set.provider_metadata, "upsert")
+    apply_runtimes(self.db, service.workspace_id, write_set.runtimes, "delete")
+    apply_resources(self.db, service.workspace_id, write_set.resources, "delete")
+    apply_tasks(self.db, service.workspace_id, write_set.tasks, "delete")
+    apply_collections(self.db, service.workspace_id, write_set.collections, "delete")
+    apply_provider_metadata(self.db, service.workspace_id, write_set.provider_metadata, "delete")
     execute(self.db, [[
       INSERT INTO operations(
         workspace_id, operation_id, revision, command_digest, result

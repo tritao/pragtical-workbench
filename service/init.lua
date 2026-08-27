@@ -77,6 +77,45 @@ local function trim_operations(service)
   end
 end
 
+local function same_value(left, right, seen)
+  if left == right then return true end
+  if type(left) ~= "table" or type(right) ~= "table" then return false end
+  seen = seen or {}
+  if seen[left] == right then return true end
+  seen[left] = right
+  for key, value in pairs(left) do
+    if not same_value(value, right[key], seen) then return false end
+  end
+  for key in pairs(right) do
+    if left[key] == nil then return false end
+  end
+  return true
+end
+
+local function changed_records(before, after)
+  local result = { upsert = {}, delete = {} }
+  before, after = before or {}, after or {}
+  for id, record in pairs(after) do
+    if not before[id] or not same_value(before[id], record) then
+      result.upsert[#result.upsert + 1] = copy(record)
+    end
+  end
+  for id in pairs(before) do
+    if not after[id] then result.delete[#result.delete + 1] = id end
+  end
+  return result
+end
+
+local function write_set(before, service)
+  return {
+    collections = changed_records(before.collections, service.collections),
+    tasks = changed_records(before.tasks, service.tasks),
+    resources = changed_records(before.resources, service.resources),
+    runtimes = changed_records(before.runtimes, service.runtimes),
+    provider_metadata = changed_records(before.provider_metadata, service.provider_metadata),
+  }
+end
+
 function Service.new(options)
   options = options or {}
   local workspace_id = options.workspace_id or options.workspace or "default"
@@ -194,8 +233,9 @@ function Service:_restore(state)
   self.event_offset = state.event_offset
 end
 
-function Service:_commit(operation_id, command_digest, changes, extra)
+function Service:_commit(operation_id, command_digest, changes, extra, checkpoint)
   local previous_revision = self.revision
+  local mutations = checkpoint and write_set(checkpoint, self)
   self.revision = self.revision + 1
   local emitted = {}
   for _, event in ipairs(changes) do
@@ -222,7 +262,7 @@ function Service:_commit(operation_id, command_digest, changes, extra)
 
   if self.store then
     local ok, message = self.store:commit(
-      self, operation_id, result, emitted, command_digest, previous_revision)
+      self, operation_id, result, emitted, command_digest, previous_revision, mutations)
     if not ok then
       local code, error_message = error_details(message)
       return self:_error(code, error_message, operation_id)
@@ -395,6 +435,19 @@ function Service:_delete_collection(command, changes)
   local collection, error_result = self:_require_record(self.collections, id, "collection")
   if not collection then return nil, error_result.message end
   self.collections[id] = nil
+  for _, child in pairs(self.collections) do
+    if child.parent_id == id then
+      child.parent_id = "root"
+      changes[#changes + 1] = {
+        type = "collection.moved",
+        entity_type = "collection",
+        entity_id = child.id,
+        parent_id = "root",
+        title = child.title,
+        order = child.order,
+      }
+    end
+  end
   for _, task in pairs(self.tasks) do
     if task.collection_id == id then task.collection_id = nil end
   end
@@ -663,6 +716,18 @@ function Service:_delete_resource(command, changes)
   local resource, error_result = self:_require_record(self.resources, id, "resource")
   if not resource then return nil, error_result.message end
   self.resources[id] = nil
+  for _, runtime in pairs(self.runtimes) do
+    if runtime.resource_id == id then
+      runtime.resource_id = nil
+      changes[#changes + 1] = {
+        type = "runtime.updated",
+        entity_type = "runtime",
+        entity_id = runtime.id,
+        status = runtime.status,
+        output_offset = runtime.output_offset,
+      }
+    end
+  end
   changes[#changes + 1] = {
     type = "resource.deleted",
     entity_type = "resource",
@@ -768,7 +833,7 @@ function Service:execute(command)
   if not result then
     return self:_error("invalid_command", handler_message, operation_id)
   end
-  local committed = self:_commit(operation_id, command_digest, changes, result)
+  local committed = self:_commit(operation_id, command_digest, changes, result, checkpoint)
   if committed.code ~= "ok" and checkpoint then
     self:_restore(checkpoint)
   end
