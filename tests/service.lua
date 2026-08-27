@@ -101,6 +101,26 @@ test.describe("Workbench Lua service", function()
     test.equal(#service:snapshot().collections, 1)
   end)
 
+  test.test("rejects reusing an operation ID for a different command", function()
+    local first = service:execute {
+      type = "collection.create",
+      operation_id = "collection-idempotent",
+      expected_revision = 0,
+      id = "collection-editor",
+      title = "Editor",
+    }
+    local conflict = service:execute {
+      type = "collection.create",
+      operation_id = "collection-idempotent",
+      expected_revision = 1,
+      id = "collection-editor",
+      title = "Different editor",
+    }
+    test.equal(first.code, "ok")
+    test.equal(conflict.code, "operation_conflict")
+    test.equal(service:snapshot().revision, 1)
+  end)
+
   test.test("supports terminal compatibility commands", function()
     local created = service:execute {
       type = "terminal.create",

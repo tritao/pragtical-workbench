@@ -1,9 +1,11 @@
 local validation = require "plugins.workbench.service.validation"
+local MessagePack = require "plugins.workbench.service.msgpack"
 
 local Service = {}
 Service.__index = Service
 
 local DEFAULT_EVENT_LIMIT = 4096
+local DEFAULT_OPERATION_LIMIT = 4096
 
 local function copy(value, seen)
   if type(value) ~= "table" then return value end
@@ -52,11 +54,35 @@ local function valid_field(check, value, field)
   return true
 end
 
+local function error_details(result)
+  if type(result) ~= "table" then
+    return "storage_error", tostring(result)
+  end
+  return result.code or "storage_error", result.message or tostring(result)
+end
+
+local function trim_operations(service)
+  local ids = {}
+  for operation_id, result in pairs(service.operations) do
+    ids[#ids + 1] = { id = operation_id, revision = result.revision or 0 }
+  end
+  table.sort(ids, function(a, b)
+    if a.revision ~= b.revision then return a.revision < b.revision end
+    return a.id < b.id
+  end)
+  while #ids > service.operation_limit do
+    local oldest = table.remove(ids, 1)
+    service.operations[oldest.id] = nil
+    service.operation_digests[oldest.id] = nil
+  end
+end
+
 function Service.new(options)
   options = options or {}
   local workspace_id = options.workspace_id or options.workspace or "default"
   local persisted = options.store and options.store:load(workspace_id)
   local event_limit = options.event_limit or DEFAULT_EVENT_LIMIT
+  local operation_limit = options.operation_limit or DEFAULT_OPERATION_LIMIT
   local service = setmetatable({
     workspace_id = workspace_id,
     name = options.name or workspace_id,
@@ -68,10 +94,12 @@ function Service.new(options)
     runtimes = {},
     provider_metadata = {},
     operations = {},
+    operation_digests = {},
     listeners = {},
     events = {},
     event_offset = 0,
     event_limit = event_limit,
+    operation_limit = operation_limit,
     store = options.store,
   }, Service)
   if persisted then
@@ -90,6 +118,7 @@ function Service.new(options)
     end
     service.provider_metadata = persisted.provider_metadata or {}
     service.operations = persisted.operations or {}
+    service.operation_digests = persisted.operation_digests or {}
     service.events = persisted.events or {}
     service.event_offset = persisted.event_offset or 0
   end
@@ -97,6 +126,7 @@ function Service.new(options)
     table.remove(service.events, 1)
     service.event_offset = service.event_offset + 1
   end
+  trim_operations(service)
   return service
 end
 
@@ -143,6 +173,7 @@ function Service:_state()
     runtimes = copy(self.runtimes),
     provider_metadata = copy(self.provider_metadata),
     operations = copy(self.operations),
+    operation_digests = copy(self.operation_digests),
     events = copy(self.events),
     event_offset = self.event_offset,
   }
@@ -158,11 +189,13 @@ function Service:_restore(state)
   self.runtimes = state.runtimes
   self.provider_metadata = state.provider_metadata
   self.operations = state.operations
+  self.operation_digests = state.operation_digests
   self.events = state.events
   self.event_offset = state.event_offset
 end
 
-function Service:_commit(operation_id, changes, extra)
+function Service:_commit(operation_id, command_digest, changes, extra)
+  local previous_revision = self.revision
   self.revision = self.revision + 1
   local emitted = {}
   for _, event in ipairs(changes) do
@@ -188,12 +221,16 @@ function Service:_commit(operation_id, changes, extra)
   }, extra)
 
   if self.store then
-    local ok, message = self.store:commit(self, operation_id, result, emitted)
+    local ok, message = self.store:commit(
+      self, operation_id, result, emitted, command_digest, previous_revision)
     if not ok then
-      return self:_error("storage_error", message, operation_id)
+      local code, error_message = error_details(message)
+      return self:_error(code, error_message, operation_id)
     end
   end
   self.operations[operation_id] = copy(result)
+  self.operation_digests[operation_id] = command_digest
+  trim_operations(self)
 
   if self._batch then
     for _, event in ipairs(emitted) do
@@ -654,8 +691,25 @@ function Service:execute(command)
 
   local operation_id = command.operation_id or command.id
     or self:_next_id("operation")
+  -- Concurrency and transport metadata are not the operation body. Retries
+  -- may carry a new expected revision, but an operation ID may not describe
+  -- a different domain command.
+  local digest_command = copy(command)
+  digest_command.operation_id = nil
+  digest_command.expected_revision = nil
+  digest_command.workspace_id = nil
+  local digest_ok, command_digest = pcall(MessagePack.encode, digest_command)
+  if not digest_ok then
+    return self:_error("invalid_command", command_digest, operation_id)
+  end
   local previous = self.operations[operation_id]
-  if previous then return copy(previous) end
+  if previous then
+    if self.operation_digests[operation_id] ~= command_digest then
+      return self:_error("operation_conflict",
+        "operation_id is already bound to a different command", operation_id)
+    end
+    return copy(previous)
+  end
 
   if command.workspace_id and command.workspace_id ~= self.workspace_id then
     return self:_error("workspace_mismatch",
@@ -714,8 +768,8 @@ function Service:execute(command)
   if not result then
     return self:_error("invalid_command", handler_message, operation_id)
   end
-  local committed = self:_commit(operation_id, changes, result)
-  if committed.code == "storage_error" and checkpoint then
+  local committed = self:_commit(operation_id, command_digest, changes, result)
+  if committed.code ~= "ok" and checkpoint then
     self:_restore(checkpoint)
   end
   return committed

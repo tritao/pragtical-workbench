@@ -8,6 +8,7 @@ local Storage = {}
 Storage.__index = Storage
 
 local DEFAULT_EVENT_LIMIT = 4096
+local DEFAULT_OPERATION_LIMIT = 4096
 
 local function bool(value)
   return value == true or value == 1
@@ -114,15 +115,17 @@ local function load_resources(db, workspace_id)
   return records
 end
 
-local function load_operations(db, workspace_id)
+local function load_operations(db, workspace_id, limit)
   local records = {}
+  local digests = {}
   for _, row in ipairs(query(db, [[
-    SELECT operation_id, result FROM operations
-      WHERE workspace_id = ? ORDER BY revision, operation_id
-  ]], { workspace_id })) do
+    SELECT operation_id, result, command_digest FROM operations
+      WHERE workspace_id = ? ORDER BY revision DESC, operation_id DESC LIMIT ?
+  ]], { workspace_id, limit or DEFAULT_OPERATION_LIMIT })) do
     records[row.operation_id] = decode(row.result, {})
+    digests[row.operation_id] = row.command_digest
   end
-  return records
+  return records, digests
 end
 
 local function load_events(db, workspace_id, limit)
@@ -196,6 +199,7 @@ function Storage.new(path, options)
     path = path,
     db = db,
     event_limit = options.event_limit or DEFAULT_EVENT_LIMIT,
+    operation_limit = options.operation_limit or DEFAULT_OPERATION_LIMIT,
   }, Storage)
 end
 
@@ -205,6 +209,8 @@ function Storage:load(workspace_id)
       FROM workspaces WHERE id = ?
   ]], { workspace_id })[1]
   if not row then return nil end
+  local operations, operation_digests = load_operations(
+    self.db, workspace_id, self.operation_limit)
   return {
     workspace_id = row.id,
     name = row.name,
@@ -216,7 +222,8 @@ function Storage:load(workspace_id)
     resources = load_resources(self.db, workspace_id),
     runtimes = load_runtimes(self.db, workspace_id),
     provider_metadata = load_provider_metadata(self.db, workspace_id),
-    operations = load_operations(self.db, workspace_id),
+    operations = operations,
+    operation_digests = operation_digests,
     events = load_events(self.db, workspace_id, self.event_limit),
   }
 end
@@ -287,22 +294,51 @@ local function save_provider_metadata(db, workspace_id, records)
   end
 end
 
-function Storage:commit(service, operation_id, result, events)
+function Storage:commit(service, operation_id, result, events, command_digest,
+    expected_previous_revision)
   local own_transaction = not self.in_transaction
   local ok, message = pcall(function()
     if own_transaction then transaction(self.db, "begin", "immediate") end
-    execute(self.db, [[
-      INSERT INTO workspaces(id, name, revision, sequence, event_offset)
-        VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        revision = excluded.revision,
-        sequence = excluded.sequence,
-        event_offset = excluded.event_offset
-    ]], {
-      service.workspace_id, service.name, service.revision, service.sequence,
-      service.event_offset or 0,
-    })
+
+    local expected = expected_previous_revision
+    if expected == nil then expected = service.revision - 1 end
+    local workspace = query(self.db, [[
+      SELECT revision FROM workspaces WHERE id = ?
+    ]], { service.workspace_id })[1]
+    local actual = workspace and workspace.revision or 0
+    if actual ~= expected then
+      error {
+        code = "revision_conflict",
+        message = "database revision " .. tostring(actual)
+          .. " does not match expected revision " .. tostring(expected),
+        expected_revision = expected,
+        actual_revision = actual,
+      }
+    end
+    if not workspace then
+      execute(self.db, [[
+        INSERT INTO workspaces(id, name, revision, sequence, event_offset)
+        VALUES (?, ?, 0, 0, 0)
+      ]], { service.workspace_id, service.name })
+    end
+
+    local existing_operation = query(self.db, [[
+      SELECT command_digest FROM operations
+       WHERE workspace_id = ? AND operation_id = ?
+    ]], { service.workspace_id, operation_id })[1]
+    if existing_operation then
+      if existing_operation.command_digest ~= command_digest then
+        error {
+          code = "operation_conflict",
+          message = "operation_id is already bound to a different command",
+        }
+      end
+      error {
+        code = "operation_exists",
+        message = "operation_id is already committed",
+      }
+    end
+
     -- Clear in dependency order. The model is rewritten in one deferred
     -- transaction, so foreign keys still protect the final graph without
     -- allowing a composite SET NULL action to erase workspace ownership.
@@ -317,13 +353,12 @@ function Storage:commit(service, operation_id, result, events)
     save_runtimes(self.db, service.workspace_id, service.runtimes)
     save_provider_metadata(self.db, service.workspace_id, service.provider_metadata)
     execute(self.db, [[
-      INSERT INTO operations(workspace_id, operation_id, revision, result)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(workspace_id, operation_id) DO UPDATE SET
-        revision = excluded.revision,
-        result = excluded.result
+      INSERT INTO operations(
+        workspace_id, operation_id, revision, command_digest, result
+      ) VALUES (?, ?, ?, ?, ?)
     ]], {
-      service.workspace_id, operation_id, service.revision, encode(result)
+      service.workspace_id, operation_id, service.revision,
+      sqlite.blob(command_digest), encode(result)
     })
     for _, event in ipairs(events or {}) do
       execute(self.db, [[
@@ -339,6 +374,31 @@ function Storage:commit(service, operation_id, result, events)
             WHERE workspace_id = ? ORDER BY event_id DESC LIMIT ?
          )
     ]], { service.workspace_id, service.workspace_id, event_limit })
+    local operation_limit = service.operation_limit or self.operation_limit
+    execute(self.db, [[
+      DELETE FROM operations
+       WHERE workspace_id = ?
+         AND operation_id NOT IN (
+           SELECT operation_id FROM operations
+            WHERE workspace_id = ?
+            ORDER BY revision DESC, operation_id DESC LIMIT ?
+         )
+    ]], { service.workspace_id, service.workspace_id, operation_limit })
+    execute(self.db, [[
+      UPDATE workspaces
+         SET name = ?, revision = ?, sequence = ?, event_offset = ?
+       WHERE id = ? AND revision = ?
+    ]], {
+      service.name, service.revision, service.sequence, service.event_offset or 0,
+      service.workspace_id, expected,
+    })
+    if self.db:changes() ~= 1 then
+      error {
+        code = "revision_conflict",
+        message = "database revision compare-and-swap failed",
+        expected_revision = expected,
+      }
+    end
     if own_transaction then transaction(self.db, "commit") end
   end)
   if not ok then

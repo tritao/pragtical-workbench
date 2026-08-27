@@ -73,6 +73,11 @@ test.describe("Workbench SQLite persistence", function()
       },
     }
     test.equal(resource.code, "ok")
+    local operation_row = assert(store.db:query([[
+      SELECT typeof(command_digest) AS digest_type FROM operations
+       WHERE workspace_id = ? AND operation_id = ?
+    ]], { workspace_id, "persist-resource" }))[1]
+    test.equal(operation_row.digest_type, "blob")
     local runtime = service:execute {
       type = "runtime.update",
       operation_id = "persist-runtime",
@@ -121,11 +126,86 @@ test.describe("Workbench SQLite persistence", function()
         id = "terminal-persisted",
         kind = "terminal",
         title = "Persisted shell",
+        config = { cwd = "/tmp", shell = "/bin/sh" },
+        status = "starting",
       },
     }
     test.same(replayed, resource)
+    local conflict = reopened:execute {
+      type = "resource.create",
+      operation_id = "persist-resource",
+      expected_revision = 5,
+      resource = {
+        id = "terminal-persisted",
+        kind = "terminal",
+        title = "Different shell",
+      },
+    }
+    test.equal(conflict.code, "operation_conflict")
     test.equal(reopened:snapshot().revision, 5)
     reopened:close()
+    os.remove(path)
+  end)
+
+  test.test("rejects a stale second service at the database CAS", function()
+    local path = os.tmpname()
+    os.remove(path)
+    local workspace_id = new_workspace_id()
+    local first_store = assert(Storage.new(path))
+    local second_store = assert(Storage.new(path))
+    local first = Service.new { workspace_id = workspace_id, store = first_store }
+    local second = Service.new { workspace_id = workspace_id, store = second_store }
+
+    test.equal(first:execute {
+      type = "collection.create",
+      operation_id = "cas-first",
+      expected_revision = 0,
+      id = "cas-collection",
+      title = "First writer",
+    }.code, "ok")
+    local stale = second:execute {
+      type = "collection.create",
+      operation_id = "cas-second",
+      expected_revision = 0,
+      id = "cas-second-collection",
+      title = "Stale writer",
+    }
+    test.equal(stale.code, "revision_conflict")
+    test.equal(second:snapshot().revision, 0)
+    test.equal(#second:snapshot().collections, 0)
+
+    first:close()
+    second:close()
+    os.remove(path)
+  end)
+
+  test.test("bounds persisted operation idempotency records", function()
+    local path = os.tmpname()
+    os.remove(path)
+    local workspace_id = new_workspace_id()
+    local store = assert(Storage.new(path, { operation_limit = 2 }))
+    local service = Service.new {
+      workspace_id = workspace_id,
+      store = store,
+      operation_limit = 2,
+    }
+    for index = 1, 3 do
+      local result = service:execute {
+        type = "workspace.rename",
+        operation_id = "operation-limit-" .. tostring(index),
+        expected_revision = index - 1,
+        name = "Workspace " .. tostring(index),
+      }
+      test.equal(result.code, "ok")
+    end
+    local rows = assert(store.db:query([[
+      SELECT operation_id FROM operations WHERE workspace_id = ?
+      ORDER BY revision
+    ]], { workspace_id }))
+    test.equal(#rows, 2)
+    test.equal(rows[1].operation_id, "operation-limit-2")
+    test.equal(rows[2].operation_id, "operation-limit-3")
+    service:close()
     os.remove(path)
   end)
 
