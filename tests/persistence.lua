@@ -1,4 +1,5 @@
 local test = require "core.test"
+local sqlite = require "sqlite"
 local Service = require "plugins.workbench.service"
 local Storage = require "plugins.workbench.service.storage"
 
@@ -10,6 +11,31 @@ local function new_workspace_id()
 end
 
 test.describe("Workbench SQLite persistence", function()
+  test.test("uses structured errors, explicit transactions, and MessagePack blobs", function()
+    local path = os.tmpname()
+    os.remove(path)
+    local store = assert(Storage.new(path))
+
+    local result, error_result = store.db:query("SELECT * FROM missing_workbench_table")
+    test.equal(result, nil)
+    test.equal(type(error_result), "table")
+    test.equal(error_result.code, 1)
+    test.equal(type(error_result.message), "string")
+
+    local blob = sqlite.blob("\0\xff")
+    local rows = assert(store.db:query("SELECT typeof(?) AS kind, ? AS value", { blob, blob }))
+    test.equal(rows[1].kind, "blob")
+    test.equal(rows[1].value, "\0\xff")
+
+    test.equal(store.db:begin("immediate"), true)
+    test.equal(store.db:in_transaction(), true)
+    test.equal(store.db:rollback(), true)
+    test.equal(store.db:in_transaction(), false)
+
+    store:close()
+    os.remove(path)
+  end)
+
   test.test("restores current state, revisions, and idempotent operations", function()
     local path = os.tmpname()
     os.remove(path)
