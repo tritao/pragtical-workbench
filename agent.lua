@@ -31,7 +31,10 @@ end
 
 local DEFAULT_MAX_HISTORY_BYTES = 16 * 1024 * 1024
 local DEFAULT_CHECKPOINT_INTERVAL_BYTES = 256 * 1024
-local MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024
+-- Checkpoints are returned in replay responses. Keep them comfortably below
+-- the 8 MiB per-client outbound queue so a large terminal cannot turn a
+-- replay request into a client disconnect.
+local MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 
 -- This is deliberately controlled only through the agent process environment.
 -- It gives the integration suite a deterministic way to terminate the agent
@@ -375,6 +378,23 @@ local function provider_action(service, command, resource_id, action)
   return resource
 end
 
+local function provider_context(service, command, runtime_id)
+  return {
+    workspace_id = service.workspace_id,
+    runtime_id = runtime_id,
+    operation_id = command and command.operation_id,
+    command = command,
+    runtime_native = runtime_native,
+  }
+end
+
+local function provider_error_message(result, fallback)
+  if type(result) == "table" then
+    return result.code or "provider_error", result.message or fallback
+  end
+  return "provider_error", tostring(result or fallback)
+end
+
 local function runtime_options(service, resource, command)
   local options, message = service.providers:runtime_spec(resource, command, {
     workspace_id = service.workspace_id,
@@ -435,6 +455,13 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   if not options then
     return service_error(service, command, provider_metadata.code, provider_metadata.message)
   end
+  local context = provider_context(service, command, runtime_id)
+  local available, availability_message = service.providers:available(resource, context)
+  if not available then
+    local code, message = provider_error_message(availability_message,
+      "runtime provider is unavailable")
+    return service_error(service, command, code, message)
+  end
   local checkpoint_interval_bytes = command.checkpoint_interval_bytes
     or configured.checkpoint_interval_bytes or DEFAULT_CHECKPOINT_INTERVAL_BYTES
   if type(checkpoint_interval_bytes) ~= "number"
@@ -461,7 +488,13 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   state.checkpoint_bytes = 0
   state.provider = resource.provider
   state.external_session_id = command.external_session_id or persisted.external_session_id
-  state.capabilities = copy_table(provider.capabilities or {})
+  local capabilities, capability_message = service.providers:capabilities(resource, context)
+  if not capabilities then
+    local code, message = provider_error_message(capability_message,
+      "runtime provider capabilities are unavailable")
+    return service_error(service, command, code, message)
+  end
+  state.capabilities = capabilities
   state.execution_policy = command.execution_policy or configured.execution_policy or {}
   if terminal_emulator then
     local emulator_ok, emulator = pcall(terminal_emulator.new, {
@@ -515,22 +548,10 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   end
   crash_at_boundary(service, "after_starting_commit")
 
-  local ok, native_or_message = pcall(runtime_native.new, options)
-  if not ok then
-    local message = tostring(native_or_message)
-    local failed = runtime_transition(service, command, runtime_id, "failed", {
-      resource_id = resource_id, ended_at = timestamp(), output_bytes = newest_offset,
-      output_offset = newest_offset, history_path = history_path,
-      oldest_offset = oldest_offset, newest_offset = newest_offset,
-      max_history_bytes = max_history_bytes,
-      checkpoint_path = checkpoint_path, checkpoint_offset = state.checkpoint_offset,
-      metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
-    }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
-    state.status = failed.code == "ok" and "failed" or "starting"
-    return service_error(service, command, "runtime_error", message)
-  end
+  local native_or_message, provider_message = service.providers:start(resource, options, context)
   if not native_or_message then
-    local message = "failed to create runtime"
+    local failure_code, message = provider_error_message(provider_message,
+      "failed to create runtime")
     local failed = runtime_transition(service, command, runtime_id, "failed", {
       resource_id = resource_id, ended_at = timestamp(), output_bytes = newest_offset,
       output_offset = newest_offset, history_path = history_path,
@@ -540,7 +561,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
       metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
     }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
     state.status = failed.code == "ok" and "failed" or "starting"
-    return service_error(service, command, "runtime_error", message)
+    return service_error(service, command, failure_code, message)
   end
 
   state.runtime = native_or_message
@@ -562,7 +583,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   }, operation_id, service.revision)
   if result.code == "ok" then crash_at_boundary(service, "after_running_commit") end
   if result.code ~= "ok" then
-    pcall(function() state.runtime:close() end)
+    service.providers:stop(resource, state.runtime, context)
     state.runtime = nil
     local failed = runtime_transition(service, command, runtime_id, "failed", {
       resource_id = resource_id, ended_at = timestamp(), output_bytes = newest_offset,
@@ -632,10 +653,12 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
 
   if state.runtime then
     crash_at_boundary(service, "during_close")
-    local closed, close_message = pcall(function() return state.runtime:close() end)
-    if not closed or close_message == false then
+    local closed, close_message = service.providers:stop(resource, state.runtime,
+      provider_context(service, command, runtime_id))
+    if not closed then
       state.status = "failed"
-      local message = closed and "runtime close failed" or tostring(close_message)
+      local message = close_message and (close_message.message or tostring(close_message))
+        or "runtime close failed"
       runtime_transition(service, command, runtime_id, "failed", {
         resource_id = state.resource_id, ended_at = timestamp(),
         output_bytes = state.output_bytes, output_offset = state.offset,
@@ -702,10 +725,14 @@ local function resize_runtime(service, runtimes, command)
   local resource, resource_error = provider_action(service, command, state.resource_id,
     "runtime.resize")
   if not resource then return resource_error end
-  local ok, message = pcall(function()
-    state.runtime:resize(command.columns or command.cols, command.rows)
-  end)
-  if not ok then return { code = "runtime_error", message = tostring(message) } end
+  local ok, message = service.providers:action(resource, state.runtime, "resize", {
+    columns = command.columns or command.cols,
+    rows = command.rows,
+  }, provider_context(service, command, command.runtime_id))
+  if not ok then
+    local code, detail = provider_error_message(message, "runtime resize failed")
+    return { code = code, message = detail }
+  end
   return { code = "ok", runtime_id = command.runtime_id }
 end
 
@@ -717,10 +744,12 @@ local function input_runtime(service, runtimes, command)
   local resource, resource_error = provider_action(service, command, state.resource_id,
     "runtime.input")
   if not resource then return resource_error end
-  local ok, written = pcall(function()
-    return state.runtime:write(command.data or "")
-  end)
-  if not ok then return { code = "runtime_error", message = tostring(written) } end
+  local written, write_message = service.providers:send_input(resource, state.runtime,
+    command.data or "", provider_context(service, command, command.runtime_id))
+  if written == nil then
+    local code, detail = provider_error_message(write_message, "runtime input failed")
+    return { code = code, message = detail }
+  end
   return { code = "ok", runtime_id = command.runtime_id, written = written }
 end
 
@@ -742,6 +771,16 @@ local function replay_runtime(service, runtimes, command)
     or persisted and (persisted.newest_offset or persisted.output_offset) or 0
   local max_history_bytes = state and state.max_history_bytes
     or persisted and persisted.max_history_bytes or DEFAULT_MAX_HISTORY_BYTES
+  -- A checkpoint can accelerate replay only after confirming that the
+  -- requested byte offset is still available. Otherwise a request for bytes
+  -- lost to history rotation would incorrectly look like a successful replay
+  -- from the checkpoint.
+  if offset < oldest_offset then
+    return {
+      code = "runtime_history_gap", oldest_offset = oldest_offset,
+      newest_offset = newest_offset,
+    }
+  end
   local replay_offset = offset
   local events = {}
   local checkpoint_path = state and state.checkpoint_path
@@ -825,7 +864,9 @@ end
 
 local function finish_runtime(service, runtimes, runtime_id, state, exit_code, signal)
   if state.runtime then
-    pcall(function() state.runtime:close() end)
+    local resource = service.resources[state.resource_id]
+    service.providers:stop(resource, state.runtime,
+      provider_context(service, nil, runtime_id))
     state.runtime = nil
   end
   write_checkpoint(state, true)
@@ -855,7 +896,9 @@ end
 
 local function fail_runtime(service, runtime_id, state, message)
   if state.runtime then
-    pcall(function() state.runtime:close() end)
+    local resource = service.resources[state.resource_id]
+    service.providers:stop(resource, state.runtime,
+      provider_context(service, nil, runtime_id))
     state.runtime = nil
   end
   write_checkpoint(state, true)
@@ -888,10 +931,14 @@ end
 local function poll_runtimes(service, runtimes)
   for runtime_id, state in pairs(runtimes) do
     if state.runtime then
-      local ok, data = pcall(function() return state.runtime:poll() end)
-      if not ok then
-        fail_runtime(service, runtime_id, state, tostring(data))
+      local resource = service.resources[state.resource_id]
+      local status, status_message = service.providers:refresh_status(resource, state.runtime,
+        provider_context(service, nil, runtime_id))
+      if not status then
+        local _, message = provider_error_message(status_message, "runtime status refresh failed")
+        fail_runtime(service, runtime_id, state, message)
       else
+        local data = status.output
         if type(data) == "string" and #data > 0 then
           local written, message = append_history(state.history_path, state, data)
           if written then
@@ -930,13 +977,9 @@ local function poll_runtimes(service, runtimes)
             })
           end
         end
-        local exited_ok, exited, exit_code, signal = pcall(function()
-          return state.runtime:exited()
-        end)
-        if exited_ok and exited ~= false and exited ~= nil then
-          finish_runtime(service, runtimes, runtime_id, state, exit_code, signal)
-        elseif not exited_ok then
-          fail_runtime(service, runtime_id, state, tostring(exited))
+        if status.status == "exited" then
+          finish_runtime(service, runtimes, runtime_id, state,
+            status.exit_code, status.signal)
         end
       end
     end
@@ -1321,8 +1364,16 @@ function Agent.run(options)
     if options.once and served and #clients == 0 then break end
   end
 
+  local providers_shutdown, shutdown_message = service.providers:shutdown {
+    workspace_id = service.workspace_id,
+    runtimes = runtimes,
+  }
   server:close()
   service:close()
+  if not providers_shutdown then
+    error(shutdown_message and (shutdown_message.message or tostring(shutdown_message))
+      or "Workbench provider shutdown failed")
+  end
   return served or not options.once
 end
 

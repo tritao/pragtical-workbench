@@ -1,3 +1,5 @@
+local Runtime = require "plugins.workbench.provider.runtime"
+
 local Shell = {
   id = "builtin.shell",
   version = 1,
@@ -114,4 +116,4 @@ function Shell.validate_metadata(metadata)
   return true
 end
 
-return Shell
+return Runtime.attach(Shell)

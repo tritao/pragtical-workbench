@@ -81,6 +81,14 @@ Clients can inspect the registered provider contract through
 actions are checked by the agent before execution, so a future provider can
 expose resources without implicitly receiving shell/runtime behavior.
 
+The service-side lifecycle boundary is exposed by the provider registry:
+`available`, `create`, `attach`, `recover`, `start`, `stop`, `restart`,
+`send_input`, `action`, `refresh_status`, `capabilities`, and `shutdown`.
+The built-in shell uses this boundary for PTY creation, polling, input,
+resize, and shutdown. Its `attach` and `recover` operations explicitly report
+that native shell runtimes cannot be reattached after the agent disappears;
+the durable runtime record is instead reconciled as `interrupted`.
+
 ## Sidebar behavior
 
 Workbench shares Pragtical's single left sidebar slot with Files. By default,

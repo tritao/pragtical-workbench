@@ -291,6 +291,14 @@ Pragtical UI plugins. Initial provider order:
 2. `git.repository`;
 3. one external provider such as GitHub or Codex.
 
+The service-provider lifecycle contract is deliberately small and provider
+neutral: `available`, `create`, `attach`, `recover`, `start`, `stop`,
+`restart`, `send_input`, `action`, `refresh_status`, `capabilities`, and
+`shutdown`. The registry owns provider registration and dispatch. A provider
+may reject `attach` or `recover` when its backend cannot survive an agent
+restart; the agent persists that fact as runtime reconciliation metadata rather
+than inventing provider-specific runtime columns.
+
 ## Sakura migration
 
 Migration is an independent feature, not a runtime compatibility layer:
@@ -407,9 +415,11 @@ The trusted service-provider registry is implemented after resources, terminal
 lifecycle, and parity between in-process and agent backends. Providers declare
 resource kinds, capabilities, actions, and events, and implement resource
 normalization, runtime specifications, runtime metadata, and metadata
-validation. `builtin.shell` is the initial provider. The trusted Codex and
-OpenCode terminal adapters are also implemented; richer session APIs and
-Pragtical UI adapters remain follow-up work.
+validation. The service lifecycle dispatch boundary is now implemented and
+`builtin.shell` uses it for agent runtime creation, input, actions, status
+refresh, and shutdown. The trusted Codex and OpenCode terminal adapters are
+also implemented; backend session recovery and richer provider actions remain
+follow-up work.
 
 ## Milestones and acceptance criteria
 

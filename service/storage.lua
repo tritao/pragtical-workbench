@@ -216,7 +216,16 @@ function Storage.new(path, options)
     db = db,
     event_limit = options.event_limit or DEFAULT_EVENT_LIMIT,
     operation_limit = options.operation_limit or DEFAULT_OPERATION_LIMIT,
+    fault_stage = options.fault_stage,
   }, Storage)
+end
+
+local function inject_fault(storage, stage)
+  if storage.fault_stage ~= stage then return end
+  error {
+    code = "fault_injected",
+    message = "injected storage failure at " .. stage,
+  }
 end
 
 function Storage:load(workspace_id)
@@ -429,6 +438,7 @@ function Storage:commit(service, operation_id, result, events, command_digest,
     end
 
     if not write_set then error "database write-set is required" end
+    inject_fault(self, "write_set")
     -- Apply all upserts before deletes so deferred relationships can be
     -- repaired atomically when a parent or resource is removed.
     apply_collections(self.db, service.workspace_id, write_set.collections, "upsert")
@@ -441,6 +451,7 @@ function Storage:commit(service, operation_id, result, events, command_digest,
     apply_tasks(self.db, service.workspace_id, write_set.tasks, "delete")
     apply_collections(self.db, service.workspace_id, write_set.collections, "delete")
     apply_provider_metadata(self.db, service.workspace_id, write_set.provider_metadata, "delete")
+    inject_fault(self, "operation_insert")
     execute(self.db, [[
       INSERT INTO operations(
         workspace_id, operation_id, revision, command_digest, result
@@ -449,6 +460,7 @@ function Storage:commit(service, operation_id, result, events, command_digest,
       service.workspace_id, operation_id, service.revision,
       sqlite.blob(command_digest), encode(result)
     })
+    inject_fault(self, "event_insert")
     for _, event in ipairs(events or {}) do
       execute(self.db, [[
         INSERT INTO events(workspace_id, event_sequence, revision, payload)
@@ -474,6 +486,7 @@ function Storage:commit(service, operation_id, result, events, command_digest,
             ORDER BY revision DESC, operation_id DESC LIMIT ?
          )
     ]], { service.workspace_id, service.workspace_id, operation_limit })
+    inject_fault(self, "revision_cas")
     execute(self.db, [[
       UPDATE workspaces
          SET name = ?, revision = ?, sequence = ?, event_sequence = ?

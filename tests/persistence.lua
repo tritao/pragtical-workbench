@@ -332,6 +332,47 @@ test.describe("Workbench SQLite persistence", function()
     service:close()
   end)
 
+  test.test("rolls back every persistence commit stage", function()
+    local stages = { "write_set", "operation_insert", "event_insert", "revision_cas" }
+    for index, stage in ipairs(stages) do
+      local path = os.tmpname()
+      os.remove(path)
+      local workspace_id = "fault-stage-" .. stage .. "-" .. tostring(index)
+      local store = assert(Storage.new(path, { fault_stage = stage }))
+      local seen = {}
+      local service = Service.new { workspace_id = workspace_id, store = store }
+      service:subscribe(function(event) seen[#seen + 1] = event end)
+      local command = {
+        type = "collection.create",
+        operation_id = "fault-stage-operation-" .. stage,
+        expected_revision = 0,
+        id = "fault-stage-collection-" .. stage,
+        title = "Fault stage",
+      }
+      local failed = service:execute(command)
+      test.equal(failed.code, "fault_injected")
+      test.equal(service:snapshot().revision, 0)
+      test.equal(#service:snapshot().collections, 0)
+      test.equal(#seen, 0)
+
+      store.fault_stage = nil
+      local committed = service:execute(command)
+      test.equal(committed.code, "ok")
+      test.equal(committed.revision, 1)
+      test.equal(#seen, 1)
+      service:close()
+
+      local reopened = Service.new {
+        workspace_id = workspace_id,
+        store = assert(Storage.new(path)),
+      }
+      test.equal(reopened:snapshot().revision, 1)
+      test.equal(#reopened:snapshot().collections, 1)
+      reopened:close()
+      os.remove(path)
+    end
+  end)
+
   test.test("commits and rolls back command batches atomically", function()
     local path = os.tmpname()
     os.remove(path)

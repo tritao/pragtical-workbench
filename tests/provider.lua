@@ -78,6 +78,114 @@ test.describe("Workbench providers", function()
     test.equal(opencode.args[5], "Review this repository")
   end)
 
+  test.test("runs the shell through the provider lifecycle contract", function()
+    local registry = ProviderRegistry.default()
+    local resource = assert(registry:create_resource {
+      kind = "terminal",
+      title = "Lifecycle shell",
+    })
+    local calls = { created = 0, polled = 0, written = nil, resized = nil }
+    local function new_handle()
+      local handle = { closed = false, did_exit = false }
+      function handle:poll()
+        calls.polled = calls.polled + 1
+        return "provider-output"
+      end
+      function handle:exited()
+        if self.did_exit then return true, 7, 9 end
+        return false
+      end
+      function handle:write(data)
+        calls.written = data
+        return #data
+      end
+      function handle:resize(columns, rows)
+        calls.resized = { columns, rows }
+        return true
+      end
+      function handle:close()
+        self.closed = true
+        return true
+      end
+      return handle
+    end
+    local native = {
+      new = function(spec)
+        calls.created = calls.created + 1
+        calls.spec = spec
+        return new_handle()
+      end,
+    }
+    local context = { runtime_native = native, workspace_id = "provider-test" }
+
+    local available = assert(registry:available(resource, context))
+    test.ok(available)
+    local capabilities = assert(registry:capabilities(resource, context))
+    capabilities.actions["runtime.start"] = false
+    test.ok(Shell.capabilities.actions["runtime.start"])
+
+    local spec = assert(registry:runtime_spec(resource, {}))
+    local runtime = assert(registry:create(resource, spec, context))
+    test.equal(calls.created, 1)
+    test.equal(calls.spec.command, spec.command)
+    test.equal(registry:send_input(resource, runtime, "input", context), 5)
+    test.equal(calls.written, "input")
+    test.ok(registry:action(resource, runtime, "resize", {
+      columns = 100, rows = 30,
+    }, context))
+    test.equal(calls.resized[1], 100)
+    test.equal(calls.resized[2], 30)
+
+    local status = assert(registry:refresh_status(resource, runtime, context))
+    test.equal(status.status, "running")
+    test.equal(status.output, "provider-output")
+    runtime.did_exit = true
+    status = assert(registry:refresh_status(resource, runtime, context))
+    test.equal(status.status, "exited")
+    test.equal(status.exit_code, 7)
+    test.equal(status.signal, 9)
+    test.ok(registry:stop(resource, runtime, context))
+    test.ok(runtime.closed)
+
+    local restarted = assert(registry:restart(resource, runtime, spec, context))
+    test.equal(calls.created, 2)
+    test.ok(registry:stop(resource, restarted, context))
+
+    local unavailable, unavailable_message = registry:available(resource, {})
+    test.ok(not unavailable)
+    test.equal(unavailable_message.code, "provider_unavailable")
+    local attached, attach_message = registry:attach(resource, {}, context)
+    test.is_nil(attached)
+    test.equal(attach_message.code, "provider_action_unsupported")
+    local recovered, recover_message = registry:recover(resource, {}, context)
+    test.is_nil(recovered)
+    test.equal(recover_message.code, "provider_action_unsupported")
+    test.ok(registry:shutdown(context))
+  end)
+
+  test.test("reports provider runtime failures and contract violations", function()
+    local registry = ProviderRegistry.default()
+    local resource = assert(registry:create_resource {
+      provider = "builtin.shell",
+      kind = "terminal",
+      title = "Failing shell",
+    })
+    local spec = assert(registry:runtime_spec(resource, {}))
+    local runtime, runtime_message = registry:start(resource, spec, {
+      runtime_native = {
+        new = function()
+          error("backend disappeared")
+        end,
+      },
+    })
+    test.is_nil(runtime)
+    test.equal(runtime_message.code, "provider_runtime_error")
+
+    local invalid, invalid_message = registry:refresh_status(resource, {}, {})
+    test.is_nil(invalid)
+    test.equal(invalid_message.code, "provider_contract")
+  end)
+
   test.test("rejects unsupported provider operations and malformed resources", function()
     local registry = ProviderRegistry.default()
     local resource, message = registry:create_resource {

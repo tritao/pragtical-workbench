@@ -30,6 +30,11 @@ local function sorted_keys(values)
   return result
 end
 
+local RUNTIME_METHODS = {
+  "available", "create", "attach", "recover", "start", "stop", "restart",
+  "send_input", "action", "refresh_status", "shutdown",
+}
+
 local function call(provider, method, ...)
   local implementation = provider[method]
   if type(implementation) ~= "function" then
@@ -44,7 +49,7 @@ local function call(provider, method, ...)
     if type(message) == "table" then return nil, message end
     return failure("provider_rejected", tostring(message or (provider.id .. " rejected " .. method)))
   end
-  return result
+  return result, message
 end
 
 function Registry.new(providers)
@@ -77,6 +82,11 @@ function Registry:register(provider)
     return failure("provider_contract", provider.id .. ".capabilities must be a table")
   end
   for _, method in ipairs { "create_resource", "update_resource", "runtime_spec" } do
+    if type(provider[method]) ~= "function" then
+      return failure("provider_contract", provider.id .. " is missing " .. method .. "()")
+    end
+  end
+  for _, method in ipairs(RUNTIME_METHODS) do
     if type(provider[method]) ~= "function" then
       return failure("provider_contract", provider.id .. " is missing " .. method .. "()")
     end
@@ -130,6 +140,96 @@ function Registry:allows(resource, action)
   local actions = provider.capabilities.actions or {}
   if not actions[action] then
     return failure("provider_action_unsupported", provider.id .. " does not support " .. action)
+  end
+  return true
+end
+
+function Registry:_runtime_call(resource, method, ...)
+  local provider, message = self:for_resource(resource)
+  if not provider then return nil, message end
+  local result, result_message = call(provider, method, resource, ...)
+  return result, result_message, provider
+end
+
+function Registry:available(resource, context)
+  local available, message = self:_runtime_call(resource, "available", context)
+  if available == nil then return nil, message end
+  if type(available) ~= "boolean" then
+    return failure("provider_contract", resource.provider .. ".available() must return a boolean")
+  end
+  return available, message
+end
+
+function Registry:create(resource, spec, context)
+  return self:_runtime_call(resource, "create", spec, context)
+end
+
+function Registry:attach(resource, runtime_record, context)
+  return self:_runtime_call(resource, "attach", runtime_record, context)
+end
+
+function Registry:recover(resource, runtime_record, context)
+  return self:_runtime_call(resource, "recover", runtime_record, context)
+end
+
+function Registry:start(resource, spec, context)
+  return self:_runtime_call(resource, "start", spec, context)
+end
+
+function Registry:stop(resource, runtime, context)
+  return self:_runtime_call(resource, "stop", runtime, context)
+end
+
+function Registry:restart(resource, runtime, spec, context)
+  return self:_runtime_call(resource, "restart", runtime, spec, context)
+end
+
+function Registry:send_input(resource, runtime, data, context)
+  return self:_runtime_call(resource, "send_input", runtime, data, context)
+end
+
+function Registry:action(resource, runtime, action, parameters, context)
+  return self:_runtime_call(resource, "action", runtime, action, parameters, context)
+end
+
+function Registry:refresh_status(resource, runtime, context)
+  local status, message, provider = self:_runtime_call(resource, "refresh_status", runtime, context)
+  if not status then return nil, message end
+  if type(status) ~= "table" then
+    return failure("provider_contract", provider.id .. ".refresh_status() must return a table")
+  end
+  if status.status ~= "running" and status.status ~= "exited" then
+    return failure("provider_contract", provider.id
+      .. ".refresh_status() returned an invalid status")
+  end
+  if status.output ~= nil and type(status.output) ~= "string" then
+    return failure("provider_contract", provider.id
+      .. ".refresh_status() output must be a string")
+  end
+  return status, provider
+end
+
+function Registry:capabilities(resource, context)
+  local provider, message = self:for_resource(resource)
+  if not provider then return nil, message end
+  if type(provider.capabilities) == "function" then
+    local capabilities, capability_message = call(provider, "capabilities", resource, context)
+    if not capabilities then return nil, capability_message end
+    if type(capabilities) ~= "table" then
+      return failure("provider_contract", provider.id .. ".capabilities() must return a table")
+    end
+    return copy(capabilities), provider
+  end
+  return copy(provider.capabilities), provider
+end
+
+function Registry:shutdown(context)
+  local providers = {}
+  for _, provider in pairs(self.providers) do providers[#providers + 1] = provider end
+  table.sort(providers, function(left, right) return left.id < right.id end)
+  for _, provider in ipairs(providers) do
+    local ok, message = call(provider, "shutdown", context)
+    if not ok then return nil, message end
   end
   return true
 end

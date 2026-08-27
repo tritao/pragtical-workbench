@@ -2,6 +2,8 @@ local function invalid(message)
   return nil, { code = "provider_invalid_resource", message = message }
 end
 
+local Runtime = require "plugins.workbench.provider.runtime"
+
 local function optional_string(value, field)
   if value ~= nil and (type(value) ~= "string" or value == "") then
     return invalid(field .. " must be a non-empty string")
@@ -180,7 +182,7 @@ local function make(spec)
     return true
   end
 
-  return Provider
+  return Runtime.attach(Provider)
 end
 
 return make
