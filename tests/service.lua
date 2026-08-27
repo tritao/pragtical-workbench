@@ -188,6 +188,60 @@ test.describe("Workbench Lua service", function()
     test.equal(service:snapshot().runtimes[1].status, "stopped")
   end)
 
+  test.test("deletes inactive runtime history without deleting its resource", function()
+    local resource = service:execute {
+      type = "resource.create",
+      operation_id = "history-resource",
+      expected_revision = 0,
+      id = "history-resource",
+      title = "History resource",
+      kind = "terminal",
+    }
+    test.equal(resource.code, "ok")
+    local runtime = service:execute {
+      type = "runtime.update",
+      operation_id = "history-runtime",
+      expected_revision = 1,
+      runtime = {
+        id = "history-runtime",
+        resource_id = "history-resource",
+        status = "stopped",
+        history_path = "/tmp/history-runtime.log",
+        checkpoint_path = "/tmp/history-runtime.log.checkpoint",
+      },
+    }
+    test.equal(runtime.code, "ok")
+    local deleted = service:execute {
+      type = "runtime.delete_history",
+      operation_id = "history-delete",
+      expected_revision = 2,
+      runtime_id = "history-runtime",
+    }
+    test.equal(deleted.code, "ok")
+    test.equal(#service:snapshot().runtimes, 0)
+    test.equal(#service:snapshot().resources, 1)
+  end)
+
+  test.test("deleting a resource removes its inactive runtime records", function()
+    test.equal(service:execute {
+      type = "resource.create", operation_id = "remove-resource-create",
+      expected_revision = 0, id = "remove-resource", title = "Remove resource",
+      kind = "terminal",
+    }.code, "ok")
+    test.equal(service:execute {
+      type = "runtime.update", operation_id = "remove-runtime-create",
+      expected_revision = 1,
+      runtime = { id = "remove-runtime", resource_id = "remove-resource", status = "stopped" },
+    }.code, "ok")
+    local deleted = service:execute {
+      type = "resource.delete", operation_id = "remove-resource-delete",
+      expected_revision = 2, resource_id = "remove-resource",
+    }
+    test.equal(deleted.code, "ok")
+    test.equal(#service:snapshot().resources, 0)
+    test.equal(#service:snapshot().runtimes, 0)
+  end)
+
   test.test("rolls back an invalid command batch and defers events", function()
     local seen = {}
     service:subscribe(function(event) seen[#seen + 1] = event end)

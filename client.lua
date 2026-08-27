@@ -12,6 +12,8 @@ local Client = {}
 Client.__index = Client
 
 local DEFAULT_REQUEST_TIMEOUT = 10
+local MAX_OUTBOUND_MESSAGES = 1024
+local MAX_OUTBOUND_BYTES = 8 * 1024 * 1024
 local PENDING = {}
 
 local Request = {}
@@ -156,6 +158,112 @@ local function agent_error(code, message)
   return { code = code, message = message }
 end
 
+local function projection_upsert(snapshot, field, id, record)
+  if not snapshot or not id or type(record) ~= "table" then return false end
+  local records = snapshot[field] or {}
+  snapshot[field] = records
+  for index, current in ipairs(records) do
+    if current.id == id or current.provider_id == id then
+      records[index] = record
+      return true
+    end
+  end
+  records[#records + 1] = record
+  return true
+end
+
+local function projection_remove(snapshot, field, id)
+  if not snapshot or not id then return false end
+  local records = snapshot[field] or {}
+  for index, current in ipairs(records) do
+    if current.id == id or current.provider_id == id then
+      table.remove(records, index)
+      return true
+    end
+  end
+  return true
+end
+
+local function refresh_terminal_projection(snapshot)
+  local terminals = {}
+  for _, resource in ipairs(snapshot.resources or {}) do
+    if resource.kind == "terminal" then terminals[#terminals + 1] = resource end
+  end
+  snapshot.terminals = terminals
+end
+
+local function apply_agent_event(snapshot, event)
+  if not snapshot or type(event) ~= "table" then return false end
+  local event_type = event.type
+  local id = event.entity_id
+  local record = event.record
+  local applied = false
+
+  if event_type == "collection.created" then
+    record = record or {
+      id = id, parent_id = event.parent_id or "root", title = event.title or "",
+    }
+    applied = projection_upsert(snapshot, "collections", id, record)
+  elseif event_type == "collection.updated" or event_type == "collection.moved"
+      or event_type == "collection.archived" then
+    applied = projection_upsert(snapshot, "collections", id, record)
+  elseif event_type == "collection.deleted" then
+    applied = projection_remove(snapshot, "collections", id)
+  elseif event_type == "task.created" then
+    record = record or { id = id, title = event.title or "" }
+    applied = projection_upsert(snapshot, "tasks", id, record)
+  elseif event_type == "task.updated" or event_type == "task.moved"
+      or event_type == "task.archived" then
+    applied = projection_upsert(snapshot, "tasks", id, record)
+  elseif event_type == "task.deleted" then
+    applied = projection_remove(snapshot, "tasks", id)
+  elseif event_type == "resource.created" then
+    record = record or {
+      id = id, kind = event.kind or "terminal", provider = event.provider,
+      title = event.title or "", status = "stopped",
+    }
+    applied = projection_upsert(snapshot, "resources", id, record)
+    refresh_terminal_projection(snapshot)
+  elseif event_type == "resource.updated" or event_type == "resource.archived"
+      or event_type == "runtime.status_changed" then
+    applied = projection_upsert(snapshot, "resources", id, record)
+    refresh_terminal_projection(snapshot)
+  elseif event_type == "resource.deleted" then
+    applied = projection_remove(snapshot, "resources", id)
+    refresh_terminal_projection(snapshot)
+  elseif event_type == "runtime.updated" then
+    applied = projection_upsert(snapshot, "runtimes", id, record)
+    if event.resource then
+      projection_upsert(snapshot, "resources", event.resource.id, event.resource)
+      refresh_terminal_projection(snapshot)
+    elseif event.resource_id then
+      for _, resource in ipairs(snapshot.resources or {}) do
+        if resource.id == event.resource_id then resource.status = event.status end
+      end
+      refresh_terminal_projection(snapshot)
+    end
+  elseif event_type == "runtime.deleted" then
+    applied = projection_remove(snapshot, "runtimes", id)
+  elseif event_type == "provider.metadata_updated" then
+    record = record and (function()
+      local copy = {}
+      for key, value in pairs(record) do copy[key] = value end
+      copy.id = copy.id or copy.provider_id
+      return copy
+    end)()
+    applied = projection_upsert(snapshot, "provider_metadata", id, record)
+  elseif event_type == "workspace.renamed" then
+    snapshot.name = event.name or (record and record.name) or snapshot.name
+    applied = true
+  end
+
+  if applied then
+    snapshot.revision = event.revision or snapshot.revision
+    snapshot.event_cursor = event.event_sequence or snapshot.event_cursor
+  end
+  return applied
+end
+
 function Client:_new_request(id, callback, options)
   options = options or {}
   local timeout = options.timeout
@@ -222,22 +330,60 @@ function Client:_queue_agent(message, expected_kind, request, handler)
     return nil, agent_error("invalid_protocol", encode_message)
   end
   encoded = encode_message
-  local sent_ok, send_ok, send_message = pcall(function()
-    return self.connection:send(encoded)
-  end)
-  if not sent_ok then
-    return nil, agent_error("agent_disconnected", send_ok)
+  if #self.outgoing >= MAX_OUTBOUND_MESSAGES
+      or self.outgoing_bytes + #encoded > MAX_OUTBOUND_BYTES then
+    return nil, agent_error("agent_backpressure",
+      "Workbench client outbound queue limit exceeded")
   end
-  if send_ok == false then
-    return nil, agent_error("agent_disconnected", send_message or "agent send failed")
+  self.outgoing[#self.outgoing + 1] = encoded
+  self.outgoing_bytes = self.outgoing_bytes + #encoded
+  if request then
+    self.pending_requests[message.request_id] = {
+      request = request,
+      expected_kind = expected_kind,
+      handler = handler,
+      deadline = request.deadline,
+    }
+    request.pending_ids[message.request_id] = true
   end
-  self.pending_requests[message.request_id] = {
-    request = request,
-    expected_kind = expected_kind,
-    handler = handler,
-    deadline = request.deadline,
-  }
-  request.pending_ids[message.request_id] = true
+  return true
+end
+
+function Client:_flush_outgoing()
+  if not self.connection then return nil, "Workbench agent is disconnected" end
+
+  if self.write_pending then
+    local called, flushed, message = pcall(function()
+      return self.connection:flush()
+    end)
+    if not called then return nil, flushed end
+    if not flushed then
+      if message == "would_block" then return true end
+      return nil, message or "agent send failed"
+    end
+    self.write_pending = false
+  end
+
+  while #self.outgoing > 0 do
+    local frame = self.outgoing[1]
+    local called, sent, message = pcall(function()
+      return self.connection:send_nonblocking(frame)
+    end)
+    if not called then return nil, sent end
+    if sent then
+      table.remove(self.outgoing, 1)
+      self.outgoing_bytes = self.outgoing_bytes - #frame
+    elseif message == "would_block" then
+      -- The native transport owns the partially written frame now. Remove it
+      -- from the Lua queue and let the next poll turn finish it.
+      table.remove(self.outgoing, 1)
+      self.outgoing_bytes = self.outgoing_bytes - #frame
+      self.write_pending = true
+      return true
+    else
+      return nil, message or "agent send failed"
+    end
+  end
   return true
 end
 
@@ -313,6 +459,9 @@ end
 function Client:_disconnect(message)
   local connection = self.connection
   self.connection = nil
+  self.outgoing = {}
+  self.outgoing_bytes = 0
+  self.write_pending = false
   self.agent_subscribed = false
   if connection then pcall(function() connection:close() end) end
   self:_fail_agent_requests(agent_error("agent_disconnected", message))
@@ -361,7 +510,9 @@ end
 function Client:_handle_agent_message(message)
   if message.kind == "event" and message.event then
     local event = message.event
-    if (event.type == "output" or event.type == "status") and event.runtime_id then
+    apply_agent_event(self.agent_snapshot, event)
+    if (event.type == "output" or event.type == "status" or event.type == "checkpoint")
+        and event.runtime_id then
       local events = self.agent_runtime_events[event.runtime_id]
       if not events then
         events = {}
@@ -399,12 +550,15 @@ function Client:_queue_agent_command(request, kind, payload, refresh_snapshot)
   local function handle_response(response)
     local result = response.result
       or agent_error("invalid_response", "agent returned no result")
+    for _, event in ipairs(result.events or {}) do
+      apply_agent_event(self.agent_snapshot, event)
+    end
     for _, event in ipairs(result.runtime_events or {}) do
       self:_handle_agent_message(Protocol.request("event", nil, {
         event = event,
       }))
     end
-    if result.code == "ok" and refresh_snapshot ~= false then
+    if result.code == "ok" and refresh_snapshot == true then
       local snapshot_message = Protocol.request("snapshot", next_id("workbench-snapshot"), {})
       local queued, queue_message = self:_queue_agent(snapshot_message, "snapshot", request,
         function(snapshot_response)
@@ -421,6 +575,18 @@ function Client:_queue_agent_command(request, kind, payload, refresh_snapshot)
     return result
   end
   return self:_queue_agent(message, "result", request, handle_response)
+end
+
+function Client:_queue_runtime_command(command)
+  if not self.connection then
+    return nil, agent_error("agent_disconnected", "Workbench agent is disconnected")
+  end
+  command = copy_command(self, command)
+  local queued, queue_message = self:_queue_agent_command(nil, "command", {
+    command = command,
+  }, false)
+  if not queued then return nil, queue_message end
+  return true
 end
 
 function Client:_agent_execute(command, refresh_snapshot)
@@ -525,10 +691,15 @@ function Client.open(options)
       requests = {},
       pending_requests = {},
       completions = {},
+      outgoing = {},
+      outgoing_bytes = 0,
+      write_pending = false,
     }, Client)
     local hello, message = client:_agent_message(Protocol.request("hello",
       next_id("workbench-hello"), {
         workspace_id = workspace_id,
+        protocol_major = Protocol.major,
+        protocol_minor = Protocol.minor,
         capabilities = { event_replay = true, event_cursors = true },
       }), "hello_result")
     if not hello then
@@ -539,6 +710,14 @@ function Client.open(options)
       connection:close()
       return nil, hello.error and hello.error.message or "Workbench agent rejected the handshake"
     end
+    local compatibility, compatibility_message = Protocol.compatibility(hello)
+    if not compatibility then
+      connection:close()
+      return nil, compatibility_message
+    end
+    client.agent_protocol = compatibility
+    client.agent_capabilities = hello.capabilities or {}
+    client.agent_capability_versions = hello.capability_versions or {}
     client.agent_snapshot, message = client:_agent_snapshot()
     if not client.agent_snapshot then
       connection:close()
@@ -610,7 +789,7 @@ function Client:execute_async(command, callback, options)
     complete_immediately(function() return self.service:execute(command) end)
   elseif self.connection then
     local queued, message = self:_queue_agent_command(request, "command",
-      { command = command }, options.refresh_snapshot ~= false)
+      { command = command }, options.refresh_snapshot == true)
     if not queued then
       self.requests[request.id] = nil
       return nil, message
@@ -675,7 +854,7 @@ function Client:execute_batch_async(commands, callback, options)
     complete_immediately(function() return self.service:execute_batch(prepared) end)
   elseif self.connection then
     local queued, message = self:_queue_agent_command(request, "batch",
-      { commands = prepared }, options.refresh_snapshot ~= false)
+      { commands = prepared }, options.refresh_snapshot == true)
     if not queued then
       self.requests[request.id] = nil
       return nil, message
@@ -779,6 +958,11 @@ function Client:poll()
   end
   if self.connection then
     local count = self:_drain_completions()
+    local flushed, flush_message = self:_flush_outgoing()
+    if not flushed then
+      self:_disconnect(flush_message)
+      return count, flush_message
+    end
     self:_expire_requests(system.get_time())
     while true do
       local received, frame, message = pcall(function()
@@ -818,10 +1002,23 @@ function Client:write_runtime(runtime_id, data)
     return self.handle:write_runtime(runtime_id, data)
   end
   if self.connection then
-    local result = self:_agent_execute({
+    local queued, message = self:_queue_runtime_command({
       type = "runtime.input", runtime_id = runtime_id, data = data,
-    }, false)
-    return result.code == "ok", result
+    })
+    return queued == true, message
+  end
+  return true
+end
+
+function Client:write_runtime_async(runtime_id, data)
+  if self.handle and self.handle.write_runtime then
+    return self.handle:write_runtime(runtime_id, data)
+  end
+  if self.connection then
+    local queued, message = self:_queue_runtime_command({
+      type = "runtime.input", runtime_id = runtime_id, data = data,
+    })
+    return queued == true, message
   end
   return true
 end
@@ -845,8 +1042,34 @@ function Client:start_runtime(runtime_id, options)
     environment = options.environment,
     term = options.term,
     scrollback_limit = options.scrollback_limit,
+    external_session_id = options.external_session_id,
+    execution_policy = options.execution_policy,
   }
   return result.code == "ok", result
+end
+
+function Client:start_runtime_async(runtime_id, options, callback)
+  if self.handle and self.handle.start_runtime then
+    return self.handle:start_runtime(runtime_id, options or {})
+  end
+  if not self.connection then return true end
+  options = options or {}
+  return self:execute_async({
+    type = "runtime.start",
+    runtime_id = runtime_id,
+    resource_id = runtime_id,
+    columns = options.columns,
+    rows = options.rows,
+    shell = options.shell,
+    command = options.command,
+    args = options.args,
+    cwd = options.cwd,
+    environment = options.environment,
+    term = options.term,
+    scrollback_limit = options.scrollback_limit,
+    external_session_id = options.external_session_id,
+    execution_policy = options.execution_policy,
+  }, callback, { refresh_snapshot = false })
 end
 
 function Client:resize_runtime(runtime_id, columns, rows)
@@ -870,6 +1093,20 @@ function Client:resize_runtime(runtime_id, columns, rows)
   return result.code == "ok", result
 end
 
+function Client:resize_runtime_async(runtime_id, columns, rows)
+  if self.handle and self.handle.resize_runtime then
+    return self.handle:resize_runtime(runtime_id, columns, rows)
+  end
+  if self.connection then
+    local queued, message = self:_queue_runtime_command {
+      type = "runtime.resize", runtime_id = runtime_id,
+      columns = columns, rows = rows,
+    }
+    return queued == true, message
+  end
+  return true
+end
+
 function Client:stop_runtime(runtime_id, options)
   if self.handle and self.handle.stop_runtime then
     return self.handle:stop_runtime(runtime_id, options or {})
@@ -887,6 +1124,16 @@ function Client:stop_runtime(runtime_id, options)
     status = "stopped",
   }
   return result.code == "ok", result
+end
+
+function Client:stop_runtime_async(runtime_id, options, callback)
+  if self.handle and self.handle.stop_runtime then
+    return self.handle:stop_runtime(runtime_id, options or {})
+  end
+  if not self.connection then return true end
+  return self:execute_async({
+    type = "runtime.stop", runtime_id = runtime_id,
+  }, callback, { refresh_snapshot = false })
 end
 
 function Client:detach_runtime(runtime_id)
@@ -911,6 +1158,18 @@ function Client:request_runtime_output(runtime_id, offset)
   return false, "runtime replay is not available"
 end
 
+function Client:request_runtime_output_async(runtime_id, offset, callback)
+  if self.handle and self.handle.request_runtime_output then
+    return self.handle:request_runtime_output(runtime_id, offset)
+  end
+  if self.connection then
+    return self:execute_async({
+      type = "runtime.replay", runtime_id = runtime_id, offset = offset or 0,
+    }, callback, { refresh_snapshot = false })
+  end
+  return false, "runtime replay is not available"
+end
+
 function Client:poll_runtime_events(runtime_id)
   if self.handle and self.handle.poll_runtime_events then
     return self.handle:poll_runtime_events(runtime_id)
@@ -929,12 +1188,17 @@ function Client:terminal_session(resource_id, options)
   for _, resource in ipairs(snapshot.terminals or {}) do
     if resource.id == resource_id then
       if self.connection then
-        local started, start_result = self:start_runtime(resource_id, options or {})
-        if not started then
-          return nil, start_result and (start_result.message or start_result.code)
-            or "unable to start Workbench runtime"
+        local request, start_message = self:start_runtime_async(resource_id, options or {},
+          function(result, error_result)
+            if error_result or not result or result.code ~= "ok" then
+              resource.status = "failed"
+            end
+          end)
+        if not request then
+          return nil, start_message and (start_message.message or start_message.code)
+            or "unable to queue Workbench runtime start"
         end
-        resource.status = "running"
+        resource.status = resource.status or "starting"
       end
       local WorkbenchSession = require "plugins.workbench.terminal_session"
       return WorkbenchSession(self, resource, options)
@@ -946,11 +1210,18 @@ end
 function Client:close()
   self:_fail_all_requests(agent_error("closed", "Workbench client is closed"))
   if self.connection then
-    pcall(function()
-      self.connection:send(Protocol.encode(Protocol.request("close", nil, {})))
-    end)
+    -- Closing is best effort. Never wait for a blocked transport while
+    -- tearing down the client.
+    if not self.write_pending and #self.outgoing == 0 then
+      pcall(function()
+        self.connection:send_nonblocking(Protocol.encode(Protocol.request("close", nil, {})))
+      end)
+    end
     self.connection:close()
     self.connection = nil
+    self.outgoing = {}
+    self.outgoing_bytes = 0
+    self.write_pending = false
   end
   if self.handle then
     self.handle:close()

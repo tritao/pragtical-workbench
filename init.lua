@@ -137,17 +137,17 @@ command.add(nil, {
 
   ["workbench:create-collection"] = function()
     local view = get_view() or open_view()
-    prompt("Collection title", function(title) view:create_collection(title) end)
+    prompt("Collection title", function(title) view:create_collection_async(title) end)
   end,
 
   ["workbench:create-task"] = function()
     local view = get_view() or open_view()
-    prompt("Task title", function(title) view:create_task(title) end)
+    prompt("Task title", function(title) view:create_task_async(title) end)
   end,
 
   ["workbench:create-terminal"] = function()
     local view = get_view() or open_view()
-    prompt("Terminal title", function(title) view:create_terminal(title) end)
+    prompt("Terminal title", function(title) view:create_terminal_async(title) end)
   end,
 
   ["workbench:import-sakura"] = function()
@@ -179,19 +179,23 @@ command.add(nil, {
           core.status_view:show_message("i", style.text, "Sakura import canceled")
           return
         end
-        local import_ok, result, import_message = pcall(function()
-          return Importer.import_file(view.client, path)
-        end)
-        if not import_ok then
-          core.error("Sakura import failed: %s", result)
-          return
+        local request, import_message = Importer.import_file_async(view.client, path,
+          function(result, error_result)
+            if error_result then
+              core.error("Sakura import failed: %s",
+                error_result.message or error_result.code)
+              return
+            end
+            if not result then
+              core.error("Sakura import failed: unknown importer error")
+              return
+            end
+            show_import_report(result)
+            if result.valid then view:refresh() end
+          end)
+        if not request and import_message then
+          core.error("Sakura import failed: %s", import_message)
         end
-        if not result then
-          core.error("Sakura import failed: %s", import_message or "unknown importer error")
-          return
-        end
-        show_import_report(result)
-        if result.valid then view:refresh() end
       end)
     end)
   end

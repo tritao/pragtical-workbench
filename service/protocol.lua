@@ -1,7 +1,10 @@
 local MessagePack = require "plugins.workbench.service.msgpack"
+local validation = require "plugins.workbench.service.validation"
 
 local protocol = {
   version = 2,
+  major = 2,
+  minor = 1,
   max_message_size = 16 * 1024 * 1024,
 }
 
@@ -41,6 +44,11 @@ local function validate(message)
   if message.protocol ~= protocol.version then
     return nil, "unsupported Workbench protocol version: " .. tostring(message.protocol)
   end
+  for _, field in ipairs { "protocol_major", "protocol_minor" } do
+    if message[field] ~= nil and not valid_cursor(message[field]) then
+      return nil, "Workbench " .. field .. " must be a non-negative integer"
+    end
+  end
   if type(message.kind) ~= "string" or not kinds[message.kind] then
     return nil, "unknown Workbench protocol message kind"
   end
@@ -51,6 +59,13 @@ local function validate(message)
   end
   if message.kind == "batch" and type(message.commands) ~= "table" then
     return nil, "Workbench batch commands must be a table"
+  end
+  if message.kind == "command" then
+    local valid, validation_message = validation.command(message.command)
+    if not valid then return nil, validation_message end
+  elseif message.kind == "batch" then
+    local valid, validation_message = validation.batch(message.commands)
+    if not valid then return nil, validation_message end
   end
   if message.kind == "subscribe" and message.after_event_sequence ~= nil
       and not valid_cursor(message.after_event_sequence) then
@@ -102,6 +117,18 @@ function protocol.request(kind, request_id, fields)
   message.request_id = request_id
   message.protocol = protocol.version
   return message
+end
+
+function protocol.compatibility(message)
+  local major = message and message.protocol_major or protocol.major
+  local minor = message and message.protocol_minor or 0
+  if major ~= protocol.major then
+    return nil, "unsupported Workbench protocol major version: " .. tostring(major)
+  end
+  return {
+    major = protocol.major,
+    minor = math.min(protocol.minor, minor),
+  }
 end
 
 return protocol

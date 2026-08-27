@@ -83,4 +83,61 @@ test.describe("Workbench agent terminal runtime", function()
     test.equal(reattached:status(), "closed")
     second:close()
   end)
+
+  test.test("bounds history and restores a persisted emulator checkpoint", function()
+    local shell, args
+    if PLATFORM == "Windows" then
+      shell = "cmd.exe"
+      args = { "/S", "/C", "echo checkpoint-output & powershell.exe -NoProfile -NonInteractive -Command Start-Sleep -Seconds 3" }
+    else
+      shell = "/bin/sh"
+      args = { "-c", "printf checkpoint-output; sleep 3" }
+    end
+
+    local first = assert(Client.open {
+      backend = "agent", endpoint = endpoint,
+      workspace_id = "agent-terminal-test",
+    })
+    local created = first:execute {
+      type = "terminal.create",
+      id = "checkpoint-terminal",
+      title = "Checkpoint shell",
+      cols = 80,
+      rows = 24,
+      status = "starting",
+      config = {
+        shell = shell,
+        args = args,
+        max_history_bytes = 64,
+        checkpoint_interval_bytes = 1,
+      },
+    }
+    test.equal(created.code, "ok")
+    local session = assert(first:terminal_session("checkpoint-terminal"))
+    test.ok(session:attach())
+    test.contains(collect_output(session, 2, "checkpoint-output"), "checkpoint-output")
+    first:close()
+
+    local second = assert(Client.open {
+      backend = "agent", endpoint = endpoint,
+      workspace_id = "agent-terminal-test",
+    })
+    local reattached = assert(second:terminal_session("checkpoint-terminal"))
+    test.ok(reattached:attach())
+    local checkpoint
+    local deadline = system.get_time() + 2
+    while not checkpoint and system.get_time() < deadline do
+      for _, event in ipairs(reattached:poll_events()) do
+        if event.type == "checkpoint" then checkpoint = event end
+      end
+      if not checkpoint then system.sleep(0.01) end
+    end
+    test.not_nil(checkpoint)
+    test.ok(reattached:apply_checkpoint(checkpoint, reattached.emulator))
+    test.equal(checkpoint.offset, checkpoint.newest_offset)
+    test.ok(checkpoint.offset - checkpoint.oldest_offset <= 64)
+    test.ok(reattached.emulator:lines())
+    reattached:terminate()
+    second:close()
+  end)
 end)

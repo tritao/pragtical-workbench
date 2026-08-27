@@ -145,6 +145,37 @@ function Sidebar:execute(command)
   return result
 end
 
+function Sidebar:execute_async(command, callback)
+  if not self.client then
+    core.error(self.error or "Workbench client is unavailable")
+    return nil
+  end
+  local function completed(result, error_result, request)
+    if error_result then
+      core.error("Workbench command failed: %s",
+        error_result.message or error_result.code or tostring(error_result))
+    elseif not result or result.code ~= "ok" then
+      core.error("Workbench command failed: %s",
+        result and (result.message or result.code) or "no result")
+      self:refresh()
+    end
+    if callback then callback(result, error_result, request) end
+  end
+  local ok, request, message = pcall(function()
+    return self.client:execute_async(command, completed)
+  end)
+  if not ok then
+    core.error("Workbench command failed: %s", request)
+    return nil, request
+  end
+  if not request then
+    core.error("Workbench command failed: %s",
+      message and (message.message or message.code) or "unable to queue command")
+    return nil, message
+  end
+  return request
+end
+
 function Sidebar:create_collection(title)
   Sidebar.next_id = Sidebar.next_id + 1
   return self:execute {
@@ -155,6 +186,16 @@ function Sidebar:create_collection(title)
   }
 end
 
+function Sidebar:create_collection_async(title, callback)
+  Sidebar.next_id = Sidebar.next_id + 1
+  return self:execute_async({
+    type = "collection.create",
+    id = "collection-" .. tostring(math.floor(system.get_time() * 1000000))
+      .. "-" .. tostring(Sidebar.next_id),
+    title = title
+  }, callback)
+end
+
 function Sidebar:create_task(title)
   Sidebar.next_id = Sidebar.next_id + 1
   return self:execute {
@@ -163,6 +204,16 @@ function Sidebar:create_task(title)
       .. "-" .. tostring(Sidebar.next_id),
     title = title
   }
+end
+
+function Sidebar:create_task_async(title, callback)
+  Sidebar.next_id = Sidebar.next_id + 1
+  return self:execute_async({
+    type = "task.create",
+    id = "task-" .. tostring(math.floor(system.get_time() * 1000000))
+      .. "-" .. tostring(Sidebar.next_id),
+    title = title
+  }, callback)
 end
 
 function Sidebar:open_terminal(terminal)
@@ -212,6 +263,42 @@ function Sidebar:create_terminal(title)
     end
   end
   return nil
+end
+
+function Sidebar:create_terminal_async(title, callback)
+  Sidebar.next_id = Sidebar.next_id + 1
+  local collection_id
+  local selected = self.selected_id and self.model.collection_by_id[self.selected_id]
+  if selected then collection_id = selected.id end
+  local id = "terminal-" .. tostring(math.floor(system.get_time() * 1000000))
+    .. "-" .. tostring(Sidebar.next_id)
+  return self:execute_async({
+    type = "terminal.create",
+    operation_id = id .. "-create",
+    id = id,
+    collection_id = collection_id,
+    title = title,
+    cols = 80,
+    rows = 24,
+    status = "starting"
+  }, function(result, error_result, request)
+    if error_result or not result or result.code ~= "ok" then
+      if callback then callback(result, error_result, request) end
+      return
+    end
+    local snapshot = self.client:snapshot()
+    self.model:replace(snapshot)
+    for _, terminal in ipairs(snapshot.terminals or {}) do
+      if terminal.id == id then
+        local view = self:open_terminal(terminal)
+        if callback then callback(result, nil, request, view) end
+        return
+      end
+    end
+    if callback then callback(nil, {
+      code = "not_found", message = "created Workbench terminal was not returned"
+    }, request) end
+  end)
 end
 
 function Sidebar:get_item_height()

@@ -702,7 +702,7 @@ function Importer.preview(path, options)
   return Importer.convert(source, options)
 end
 
-function Importer.import_file(client, path, options)
+local function prepare_import(client, path, options)
   options = options or {}
   local plan, message = Importer.preview(path, options)
   if not plan then return nil, message end
@@ -736,8 +736,10 @@ function Importer.import_file(client, path, options)
     return plan
   end
   plan.backup_path = backup_path
+  return plan
+end
 
-  local batch_result = client:execute_batch(plan.commands)
+local function finish_import(client, plan, batch_result)
   plan.results = batch_result.results or {}
   if batch_result.code ~= "ok" then
     local failed_command = plan.commands[#plan.results] or plan.commands[1]
@@ -772,6 +774,39 @@ function Importer.import_file(client, path, options)
     add_error(plan.errors, "final Workbench snapshot did not contain every imported record")
   end
   return plan
+end
+
+function Importer.import_file(client, path, options)
+  local plan, message = prepare_import(client, path, options)
+  if not plan then return nil, message end
+  if plan.dry_run then return plan end
+  return finish_import(client, plan, client:execute_batch(plan.commands))
+end
+
+function Importer.import_file_async(client, path, callback, options)
+  if type(callback) ~= "function" then
+    return nil, "Sakura import callback must be a function"
+  end
+  local plan, message = prepare_import(client, path, options)
+  if not plan then return nil, message end
+  if plan.dry_run then
+    callback(plan)
+    return true
+  end
+
+  local request, queue_message = client:execute_batch_async(plan.commands,
+    function(batch_result, error_result, completed_request)
+      if error_result then
+        plan.valid = false
+        add_error(plan.errors, "import failed: " .. tostring(
+          error_result.message or error_result.code))
+        callback(plan, error_result, completed_request)
+        return
+      end
+      callback(finish_import(client, plan, batch_result), nil, completed_request)
+    end, {})
+  if not request then return nil, queue_message end
+  return request
 end
 
 Importer._parse_key_file = parse_key_file

@@ -149,7 +149,10 @@ local function load_runtimes(db, workspace_id)
   local records = {}
   for _, row in ipairs(query(db, [[
     SELECT id, resource_id, status, pid, started_at, ended_at,
-           output_bytes, output_offset, history_path, metadata
+           output_bytes, output_offset, history_path, metadata,
+           oldest_offset, newest_offset, max_history_bytes,
+           checkpoint_path, checkpoint_offset, provider, external_session_id,
+           capabilities, execution_policy
       FROM runtimes WHERE workspace_id = ? ORDER BY id
   ]], { workspace_id })) do
     records[row.id] = {
@@ -163,6 +166,15 @@ local function load_runtimes(db, workspace_id)
       output_offset = row.output_offset or 0,
       history_path = row.history_path,
       metadata = decode(row.metadata, {}),
+      oldest_offset = row.oldest_offset or 0,
+      newest_offset = row.newest_offset or row.output_offset or 0,
+      max_history_bytes = row.max_history_bytes or 16 * 1024 * 1024,
+      checkpoint_path = row.checkpoint_path,
+      checkpoint_offset = row.checkpoint_offset or 0,
+      provider = row.provider,
+      external_session_id = row.external_session_id,
+      capabilities = decode(row.capabilities, {}),
+      execution_policy = decode(row.execution_policy, {}),
     }
   end
   return records
@@ -311,8 +323,11 @@ local function apply_runtimes(db, workspace_id, changes, mode)
     execute(db, [[
       INSERT INTO runtimes(
         workspace_id, id, resource_id, status, pid, started_at, ended_at,
-        output_bytes, output_offset, history_path, metadata
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        output_bytes, output_offset, history_path, metadata,
+        oldest_offset, newest_offset, max_history_bytes,
+        checkpoint_path, checkpoint_offset, provider, external_session_id,
+        capabilities, execution_policy
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(workspace_id, id) DO UPDATE SET
         resource_id = excluded.resource_id,
         status = excluded.status,
@@ -322,11 +337,25 @@ local function apply_runtimes(db, workspace_id, changes, mode)
         output_bytes = excluded.output_bytes,
         output_offset = excluded.output_offset,
         history_path = excluded.history_path,
-        metadata = excluded.metadata
+        metadata = excluded.metadata,
+        oldest_offset = excluded.oldest_offset,
+        newest_offset = excluded.newest_offset,
+        max_history_bytes = excluded.max_history_bytes,
+        checkpoint_path = excluded.checkpoint_path,
+        checkpoint_offset = excluded.checkpoint_offset,
+        provider = excluded.provider,
+        external_session_id = excluded.external_session_id,
+        capabilities = excluded.capabilities,
+        execution_policy = excluded.execution_policy
     ]], {
       workspace_id, record.id, record.resource_id, record.status or "stopped", record.pid,
       record.started_at, record.ended_at, record.output_bytes or 0,
       record.output_offset or 0, record.history_path, encode(record.metadata or {}),
+      record.oldest_offset or 0, record.newest_offset or record.output_offset or 0,
+      record.max_history_bytes or 16 * 1024 * 1024,
+      record.checkpoint_path, record.checkpoint_offset or 0,
+      record.provider, record.external_session_id,
+      encode(record.capabilities or {}), encode(record.execution_policy or {}),
     })
   end end
   if mode ~= "upsert" then for _, id in ipairs(changes.delete) do

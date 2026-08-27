@@ -1,9 +1,17 @@
 local common = require "core.common"
+local validation = require "plugins.workbench.service.validation"
 local Protocol = require "plugins.workbench.service.protocol"
+local MessagePack = require "plugins.workbench.service.msgpack"
 local Service = require "plugins.workbench.service"
 local Storage = require "plugins.workbench.service.storage"
 local transport = require "workbench_transport"
 local runtime_native = require "workbench_runtime"
+
+local terminal_emulator
+do
+  local loaded, module = pcall(require, "workbench_emulator")
+  if loaded then terminal_emulator = module end
+end
 
 local Agent = {}
 
@@ -21,7 +29,11 @@ local function timestamp()
   return os.date("!%Y-%m-%dT%H:%M:%SZ")
 end
 
-local function history_size(path)
+local DEFAULT_MAX_HISTORY_BYTES = 16 * 1024 * 1024
+local DEFAULT_CHECKPOINT_INTERVAL_BYTES = 256 * 1024
+local MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024
+
+local function history_file_size(path)
   local file, message = io.open(path, "ab")
   if not file then return nil, message end
   local size = file:seek("end") or 0
@@ -29,31 +41,212 @@ local function history_size(path)
   return size
 end
 
-local function append_history(path, data)
-  local file, message = io.open(path, "ab")
+local function replace_history(path, data)
+  local temporary_path = path .. ".tmp"
+  local file, message = io.open(temporary_path, "wb")
   if not file then return nil, message end
   local ok, write_message = file:write(data)
+  if ok then ok, write_message = file:flush() end
   file:close()
-  if not ok then return nil, write_message end
-  return true
+  if not ok then
+    os.remove(temporary_path)
+    return nil, write_message
+  end
+  if os.rename(temporary_path, path) then return true end
+  -- Windows does not replace an existing file with os.rename. The temporary
+  -- file is complete before this fallback removes the old history.
+  os.remove(path)
+  if os.rename(temporary_path, path) then return true end
+  os.remove(temporary_path)
+  return nil, "unable to replace runtime history"
 end
 
-local function read_history(path, offset)
+local function read_file(path, maximum)
   local file, message = io.open(path, "rb")
   if not file then return nil, message end
   local size = file:seek("end") or 0
-  if offset > size then
+  if maximum and size > maximum then
     file:close()
-    return nil, "runtime replay offset is beyond the available history"
+    return nil, "file exceeds the maximum allowed size"
   end
-  file:seek("set", offset)
-  local data = file:read(64 * 1024) or ""
+  file:seek("set")
+  local data = file:read("*a")
   file:close()
-  return data, size
+  return data or ""
+end
+
+local function read_checkpoint(path)
+  local data = read_file(path, MAX_CHECKPOINT_BYTES)
+  if not data then return nil end
+  local ok, checkpoint = pcall(MessagePack.decode, data)
+  if not ok or type(checkpoint) ~= "table"
+      or checkpoint.version ~= 1
+      or type(checkpoint.offset) ~= "number"
+      or checkpoint.offset < 0
+      or checkpoint.offset ~= math.floor(checkpoint.offset)
+      or type(checkpoint.data) ~= "string" then
+    return nil
+  end
+  return checkpoint.offset, checkpoint.data
+end
+
+local function write_checkpoint(state, force)
+  if not state.emulator or not state.checkpoint_path then return true, false end
+  local interval = state.checkpoint_interval_bytes or DEFAULT_CHECKPOINT_INTERVAL_BYTES
+  if not force and state.newest_offset - (state.checkpoint_offset or 0) < interval then
+    return true, false
+  end
+  local ok, data = pcall(function() return state.emulator:checkpoint() end)
+  if not ok then return nil, tostring(data) end
+  if type(data) ~= "string" or #data > MAX_CHECKPOINT_BYTES then
+    return nil, "terminal checkpoint exceeds the maximum allowed size"
+  end
+  local encoded_ok, encoded = pcall(MessagePack.encode, {
+    version = 1,
+    offset = state.newest_offset,
+    data = data,
+  })
+  if not encoded_ok then return nil, tostring(encoded) end
+  local replaced, replace_message = replace_history(state.checkpoint_path, encoded)
+  if not replaced then return nil, replace_message end
+  state.checkpoint_offset = state.newest_offset
+  state.checkpoint_bytes = #data
+  return true, true
+end
+
+local function read_history_slice(path, relative_offset, length)
+  local file, message = io.open(path, "rb")
+  if not file then return nil, message end
+  file:seek("set", relative_offset)
+  local data = file:read(length) or ""
+  file:close()
+  return data
+end
+
+local function history_bounds(path, persisted)
+  local size, message = history_file_size(path)
+  if not size then return nil, nil, message end
+  local newest = persisted.newest_offset
+    or persisted.output_offset
+    or size
+  local oldest = persisted.oldest_offset
+  if oldest == nil then oldest = math.max(0, newest - size) end
+  if oldest < 0 or newest < oldest or newest - oldest ~= size then
+    -- A crash may leave the file and SQLite row at different points. Keep
+    -- the newest persisted logical offset and describe the bytes we do have.
+    newest = math.max(newest, size)
+    oldest = math.max(0, newest - size)
+  end
+  return oldest, newest
+end
+
+local function append_history(path, state, data)
+  local oldest = state.oldest_offset or 0
+  local newest = state.newest_offset or state.offset or oldest
+  local max_bytes = state.max_history_bytes or DEFAULT_MAX_HISTORY_BYTES
+  local size, message = history_file_size(path)
+  if not size then return nil, message end
+  if newest - oldest ~= size then
+    oldest = math.max(0, newest - size)
+  end
+
+  local new_newest = newest + #data
+  local keep_old = math.max(0, max_bytes - #data)
+  local old_data = ""
+  if keep_old > 0 and size > 0 then
+    old_data, message = read_history_slice(path, math.max(0, size - keep_old), keep_old)
+    if not old_data then return nil, message end
+  end
+  local retained = old_data .. data
+  if #retained > max_bytes then retained = retained:sub(#retained - max_bytes + 1) end
+  local new_oldest = new_newest - #retained
+  if #retained ~= size + #data then
+    local replaced, replace_message = replace_history(path, retained)
+    if not replaced then return nil, replace_message end
+  else
+    local file, open_message = io.open(path, "ab")
+    if not file then return nil, open_message end
+    local ok, write_message = file:write(data)
+    file:close()
+    if not ok then return nil, write_message end
+  end
+  state.oldest_offset = new_oldest
+  state.newest_offset = new_newest
+  state.offset = new_newest
+  state.output_bytes = new_newest
+  return true
+end
+
+local function trim_history(path, oldest, newest, max_bytes)
+  local size = newest - oldest
+  if size <= max_bytes then return oldest, newest end
+  local data, message = read_history_slice(path, size - max_bytes, max_bytes)
+  if not data then return nil, message end
+  local replaced, replace_message = replace_history(path, data)
+  if not replaced then return nil, replace_message end
+  return newest - max_bytes, newest
+end
+
+local function replay_history(path, offset, oldest, newest)
+  if offset < oldest then
+    return nil, {
+      code = "runtime_history_gap", oldest_offset = oldest,
+      newest_offset = newest,
+    }
+  end
+  if offset > newest then
+    return nil, {
+      code = "runtime_replay_error",
+      message = "runtime replay offset is beyond the newest available history",
+    }
+  end
+  local length = math.min(64 * 1024, newest - offset)
+  local data, message = read_history_slice(path, offset - oldest, length)
+  if not data then return nil, { code = "runtime_replay_error", message = message } end
+  return data
 end
 
 local function runtime_state(runtimes, runtime_id)
   return runtimes[runtime_id]
+end
+
+local function remove_runtime_file(history_directory, runtime_id, path)
+  if type(path) ~= "string" then return end
+  local name = path:match("[^/\\]+$")
+  local expected = safe_id(runtime_id)
+  if name ~= expected .. ".log" and name ~= expected .. ".log.checkpoint"
+      and name ~= expected .. ".checkpoint" then
+    return
+  end
+  local prefix = history_directory .. "/"
+  if path:sub(1, #prefix) ~= prefix then return end
+  os.remove(path)
+  os.remove(path .. ".tmp")
+end
+
+local function garbage_collect_runtime_files(service, history_directory)
+  if not system.list_dir then return end
+  local referenced = {}
+  for _, runtime in pairs(service.runtimes) do
+    for _, path in ipairs { runtime.history_path, runtime.checkpoint_path } do
+      if type(path) == "string" then
+        local name = path:match("[^/\\]+$")
+        if name then
+          referenced[name] = true
+          referenced[name .. ".tmp"] = true
+        end
+      end
+    end
+  end
+  local entries = system.list_dir(history_directory)
+  if type(entries) ~= "table" then return end
+  for _, name in ipairs(entries) do
+    if not referenced[name]
+        and (name:match("%.log$") or name:match("%.checkpoint$")
+          or name:match("%.tmp$")) then
+      os.remove(history_directory .. "/" .. name)
+    end
+  end
 end
 
 local function queue_runtime_event(state, event)
@@ -112,7 +305,9 @@ local function runtime_transition(service, command, runtime_id, status, fields,
   }
   for _, field in ipairs {
     "started_at", "ended_at", "output_bytes", "output_offset", "history_path",
-    "pid", "metadata"
+    "oldest_offset", "newest_offset", "max_history_bytes", "checkpoint_path",
+    "checkpoint_offset", "pid", "metadata", "provider", "external_session_id",
+    "capabilities", "execution_policy"
   } do
     if fields and fields[field] ~= nil then runtime[field] = fields[field] end
   end
@@ -123,6 +318,22 @@ local function runtime_transition(service, command, runtime_id, status, fields,
     expected_revision = expected_revision == nil and service.revision or expected_revision,
     runtime = runtime,
   }
+end
+
+local function persist_runtime_history(service, runtime_id, state)
+  local result = runtime_transition(service, {}, runtime_id, state.status, {
+    resource_id = state.resource_id,
+    output_bytes = state.output_bytes,
+    output_offset = state.offset,
+    history_path = state.history_path,
+    oldest_offset = state.oldest_offset,
+    newest_offset = state.newest_offset,
+    max_history_bytes = state.max_history_bytes,
+    checkpoint_path = state.checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
+  }, transition_operation_id(runtime_id, "checkpoint", service.revision),
+    service.revision)
+  return result.code == "ok", result.message
 end
 
 local function runtime_failure_metadata(runtime, message)
@@ -161,7 +372,9 @@ local function runtime_options(service, resource, command)
     workspace_id = service.workspace_id,
   })
   if not metadata then return nil, metadata_message end
-  return options, metadata
+  local provider, provider_message = service.providers:for_resource(resource)
+  if not provider then return nil, provider_message end
+  return options, metadata, provider
 end
 
 local function start_runtime(service, runtimes, history_directory, command, skip_preflight)
@@ -184,14 +397,39 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   local persisted = service.runtimes[runtime_id] or {}
   local history_path = persisted.history_path
     or (history_directory .. "/" .. safe_id(runtime_id) .. ".log")
-  local offset, history_message = history_size(history_path)
-  if not offset then
+  local checkpoint_path = persisted.checkpoint_path or (history_path .. ".checkpoint")
+  local configured = resource.config or {}
+  local max_history_bytes = command.max_history_bytes
+    or configured.max_history_bytes
+    or persisted.max_history_bytes
+    or DEFAULT_MAX_HISTORY_BYTES
+  if type(max_history_bytes) ~= "number" or max_history_bytes < 1
+      or max_history_bytes ~= math.floor(max_history_bytes) then
+    return service_error(service, command, "invalid_command",
+      "runtime.max_history_bytes must be a positive integer")
+  end
+  local oldest_offset, newest_offset, history_message = history_bounds(history_path, persisted)
+  if not oldest_offset then
     return service_error(service, command, "storage_error", history_message)
   end
+  local trimmed_oldest, trim_message = trim_history(history_path, oldest_offset,
+    newest_offset, max_history_bytes)
+  if not trimmed_oldest then
+    return service_error(service, command, "storage_error", trim_message)
+  end
+  oldest_offset = trimmed_oldest
 
-  local options, provider_metadata = runtime_options(service, resource, command)
+  local options, provider_metadata, provider = runtime_options(service, resource, command)
   if not options then
     return service_error(service, command, provider_metadata.code, provider_metadata.message)
+  end
+  local checkpoint_interval_bytes = command.checkpoint_interval_bytes
+    or configured.checkpoint_interval_bytes or DEFAULT_CHECKPOINT_INTERVAL_BYTES
+  if type(checkpoint_interval_bytes) ~= "number"
+      or checkpoint_interval_bytes < 1
+      or checkpoint_interval_bytes ~= math.floor(checkpoint_interval_bytes) then
+    return service_error(service, command, "invalid_command",
+      "runtime.checkpoint_interval_bytes must be a positive integer")
   end
   local state = current or {
     id = runtime_id,
@@ -200,17 +438,63 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   }
   state.resource_id = resource_id
   state.history_path = history_path
-  state.offset = offset
-  state.output_bytes = offset
+  state.checkpoint_path = checkpoint_path
+  state.oldest_offset = oldest_offset
+  state.newest_offset = newest_offset
+  state.max_history_bytes = max_history_bytes
+  state.checkpoint_interval_bytes = checkpoint_interval_bytes
+  state.offset = newest_offset
+  state.output_bytes = newest_offset
+  state.checkpoint_offset = persisted.checkpoint_offset or 0
+  state.checkpoint_bytes = 0
+  state.provider = resource.provider
+  state.external_session_id = command.external_session_id or persisted.external_session_id
+  state.capabilities = copy_table(provider.capabilities or {})
+  state.execution_policy = command.execution_policy or configured.execution_policy or {}
+  if terminal_emulator then
+    local emulator_ok, emulator = pcall(terminal_emulator.new, {
+      columns = options.columns,
+      rows = options.rows,
+      scrollback_limit = options.scrollback_limit,
+      term = options.term,
+    })
+    if emulator_ok and emulator then
+      local checkpoint_offset, checkpoint_data = read_checkpoint(checkpoint_path)
+      if checkpoint_offset and checkpoint_offset >= oldest_offset
+          and checkpoint_offset <= newest_offset then
+        local restored, restore_result = pcall(function()
+          return emulator:restore_checkpoint(checkpoint_data)
+        end)
+        if restored and restore_result ~= false then
+          state.checkpoint_offset = checkpoint_offset
+          state.checkpoint_bytes = #checkpoint_data
+          state.emulator = emulator
+        else
+          pcall(function() emulator:close() end)
+        end
+      else
+        state.emulator = emulator
+      end
+    end
+  end
   state.status = "starting"
   runtimes[runtime_id] = state
 
   local starting = runtime_transition(service, command, runtime_id, "starting", {
     resource_id = resource_id,
-    output_bytes = offset,
-    output_offset = offset,
+    output_bytes = newest_offset,
+    output_offset = newest_offset,
     history_path = history_path,
+    oldest_offset = oldest_offset,
+    newest_offset = newest_offset,
+    max_history_bytes = max_history_bytes,
+    checkpoint_path = checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
     metadata = provider_metadata,
+    provider = state.provider,
+    external_session_id = state.external_session_id,
+    capabilities = state.capabilities,
+    execution_policy = state.execution_policy,
   }, transition_operation_id(runtime_id, "starting", service.revision),
     command.expected_revision)
   if starting.code ~= "ok" then
@@ -222,8 +506,11 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   if not ok then
     local message = tostring(native_or_message)
     local failed = runtime_transition(service, command, runtime_id, "failed", {
-      resource_id = resource_id, ended_at = timestamp(), output_bytes = offset,
-      output_offset = offset, history_path = history_path,
+      resource_id = resource_id, ended_at = timestamp(), output_bytes = newest_offset,
+      output_offset = newest_offset, history_path = history_path,
+      oldest_offset = oldest_offset, newest_offset = newest_offset,
+      max_history_bytes = max_history_bytes,
+      checkpoint_path = checkpoint_path, checkpoint_offset = state.checkpoint_offset,
       metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
     }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
     state.status = failed.code == "ok" and "failed" or "starting"
@@ -232,8 +519,11 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   if not native_or_message then
     local message = "failed to create runtime"
     local failed = runtime_transition(service, command, runtime_id, "failed", {
-      resource_id = resource_id, ended_at = timestamp(), output_bytes = offset,
-      output_offset = offset, history_path = history_path,
+      resource_id = resource_id, ended_at = timestamp(), output_bytes = newest_offset,
+      output_offset = newest_offset, history_path = history_path,
+      oldest_offset = oldest_offset, newest_offset = newest_offset,
+      max_history_bytes = max_history_bytes,
+      checkpoint_path = checkpoint_path, checkpoint_offset = state.checkpoint_offset,
       metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
     }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
     state.status = failed.code == "ok" and "failed" or "starting"
@@ -248,14 +538,22 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     output_bytes = state.output_bytes,
     output_offset = state.offset,
     history_path = history_path,
+    oldest_offset = state.oldest_offset,
+    newest_offset = state.newest_offset,
+    max_history_bytes = max_history_bytes,
+    checkpoint_path = checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
     metadata = provider_metadata,
   }, operation_id, service.revision)
   if result.code ~= "ok" then
     pcall(function() state.runtime:close() end)
     state.runtime = nil
     local failed = runtime_transition(service, command, runtime_id, "failed", {
-      resource_id = resource_id, ended_at = timestamp(), output_bytes = offset,
-      output_offset = offset, history_path = history_path,
+      resource_id = resource_id, ended_at = timestamp(), output_bytes = newest_offset,
+      output_offset = newest_offset, history_path = history_path,
+      oldest_offset = oldest_offset, newest_offset = newest_offset,
+      max_history_bytes = max_history_bytes,
+      checkpoint_path = checkpoint_path, checkpoint_offset = state.checkpoint_offset,
       metadata = runtime_failure_metadata(service.runtimes[runtime_id], result.message),
     }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
     state.status = failed.code == "ok" and "failed" or "starting"
@@ -282,8 +580,15 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
       resource_id = persisted.resource_id,
       pending = {},
       history_path = persisted.history_path,
-      offset = persisted.output_offset or 0,
-      output_bytes = persisted.output_bytes or 0,
+      oldest_offset = persisted.oldest_offset or 0,
+      newest_offset = persisted.newest_offset or persisted.output_offset or 0,
+      max_history_bytes = persisted.max_history_bytes or DEFAULT_MAX_HISTORY_BYTES,
+      checkpoint_path = persisted.checkpoint_path
+        or (persisted.history_path and persisted.history_path .. ".checkpoint"),
+      checkpoint_offset = persisted.checkpoint_offset or 0,
+      offset = persisted.newest_offset or persisted.output_offset or 0,
+      output_bytes = persisted.output_bytes or persisted.newest_offset
+        or persisted.output_offset or 0,
       status = persisted.status,
     }
     runtimes[runtime_id] = state
@@ -298,6 +603,11 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
     output_bytes = state.output_bytes,
     output_offset = state.offset,
     history_path = state.history_path,
+    oldest_offset = state.oldest_offset,
+    newest_offset = state.newest_offset,
+    max_history_bytes = state.max_history_bytes,
+    checkpoint_path = state.checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
   }, transition_operation_id(runtime_id, "stopping", service.revision),
     skip_preflight and service.revision or command.expected_revision)
   if stopping.code ~= "ok" then return stopping end
@@ -312,6 +622,11 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
         resource_id = state.resource_id, ended_at = timestamp(),
         output_bytes = state.output_bytes, output_offset = state.offset,
         history_path = state.history_path,
+        oldest_offset = state.oldest_offset,
+        newest_offset = state.newest_offset,
+        max_history_bytes = state.max_history_bytes,
+        checkpoint_path = state.checkpoint_path,
+        checkpoint_offset = state.checkpoint_offset,
         metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
       }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
       return service_error(service, command, "runtime_error", message)
@@ -319,12 +634,21 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
     state.runtime = nil
   end
 
+  -- Checkpoint after the final output has been appended, before persisting the
+  -- stopped transition. A failed checkpoint is recoverable from history.
+  write_checkpoint(state, true)
+
   local result = runtime_transition(service, command, runtime_id, "stopped", {
     resource_id = state.resource_id,
     ended_at = timestamp(),
     output_bytes = state.output_bytes,
     output_offset = state.offset,
     history_path = state.history_path,
+    oldest_offset = state.oldest_offset,
+    newest_offset = state.newest_offset,
+    max_history_bytes = state.max_history_bytes,
+    checkpoint_path = state.checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
   }, operation_id, service.revision)
   if result.code == "ok" then state.status = "stopped" end
   return result
@@ -392,17 +716,91 @@ local function replay_runtime(service, runtimes, command)
     return { code = "runtime_not_found", message = "runtime history is not available" }
   end
   local offset = command.offset or 0
-  local data, size = read_history(path, offset)
-  if not data then return { code = "runtime_replay_error", message = size } end
+  local oldest_offset = state and state.oldest_offset
+    or persisted and persisted.oldest_offset or 0
+  local newest_offset = state and state.newest_offset
+    or persisted and (persisted.newest_offset or persisted.output_offset) or 0
+  local max_history_bytes = state and state.max_history_bytes
+    or persisted and persisted.max_history_bytes or DEFAULT_MAX_HISTORY_BYTES
+  local replay_offset = offset
   local events = {}
+  local checkpoint_path = state and state.checkpoint_path
+    or persisted and persisted.checkpoint_path
+  local checkpoint_offset, checkpoint_data
+  if checkpoint_path then checkpoint_offset, checkpoint_data = read_checkpoint(checkpoint_path) end
+  if checkpoint_offset and checkpoint_data and offset < checkpoint_offset
+      and checkpoint_offset >= oldest_offset and checkpoint_offset <= newest_offset then
+    events[#events + 1] = {
+      type = "checkpoint", runtime_id = command.runtime_id,
+      offset = checkpoint_offset, data = checkpoint_data,
+      oldest_offset = oldest_offset, newest_offset = newest_offset,
+    }
+    replay_offset = checkpoint_offset
+  end
+  local data, replay_error = replay_history(path, replay_offset, oldest_offset, newest_offset)
+  if not data then return replay_error end
   if #data > 0 then
-    events[1] = {
+    events[#events + 1] = {
       type = "output", runtime_id = command.runtime_id,
-      offset = offset, data = data,
+      offset = replay_offset, data = data,
+      oldest_offset = oldest_offset, newest_offset = newest_offset,
     }
   end
   return { code = "ok", runtime_id = command.runtime_id,
-    offset = offset, available = size, runtime_events = events }
+    offset = offset, available = newest_offset, oldest_offset = oldest_offset,
+    newest_offset = newest_offset, max_history_bytes = max_history_bytes,
+    checkpoint_offset = checkpoint_offset,
+    runtime_events = events }
+end
+
+local function delete_runtime_history(service, runtimes, history_directory, command)
+  local runtime_id = command.runtime_id
+  local state = runtime_state(runtimes, runtime_id)
+  local persisted = service.runtimes[runtime_id]
+  local history_path = state and state.history_path or persisted and persisted.history_path
+  local checkpoint_path = state and state.checkpoint_path
+    or persisted and persisted.checkpoint_path
+  if state and state.runtime then
+    return service_error(service, command, "runtime_active",
+      "runtime history cannot be deleted while the runtime is active")
+  end
+  local result = service:execute(command)
+  if result.code == "ok" then
+    if state and state.emulator then pcall(function() state.emulator:close() end) end
+    runtimes[runtime_id] = nil
+    remove_runtime_file(history_directory, runtime_id, history_path)
+    remove_runtime_file(history_directory, runtime_id, checkpoint_path)
+  end
+  return result
+end
+
+local function delete_resource(service, runtimes, history_directory, command)
+  local resource_id = command.resource_id or command.terminal_id or command.id
+  local removed = {}
+  for runtime_id, state in pairs(runtimes) do
+    if state.resource_id == resource_id then
+      if state.runtime then
+        return service_error(service, command, "runtime_active",
+          "resource cannot be deleted while its runtime is active")
+      end
+      removed[#removed + 1] = {
+        id = runtime_id,
+        history_path = state.history_path,
+        checkpoint_path = state.checkpoint_path,
+        emulator = state.emulator,
+      }
+    end
+  end
+  local result = service:execute(command)
+  if result.code == "ok" then
+    for _, runtime in ipairs(removed) do
+      if runtime.emulator then pcall(function() runtime.emulator:close() end) end
+      runtimes[runtime.id] = nil
+      remove_runtime_file(history_directory, runtime.id, runtime.history_path)
+      remove_runtime_file(history_directory, runtime.id, runtime.checkpoint_path)
+    end
+  end
+  return result
 end
 
 local function finish_runtime(service, runtimes, runtime_id, state, exit_code, signal)
@@ -410,18 +808,25 @@ local function finish_runtime(service, runtimes, runtime_id, state, exit_code, s
     pcall(function() state.runtime:close() end)
     state.runtime = nil
   end
+  write_checkpoint(state, true)
   local result = runtime_transition(service, {}, runtime_id, "exited", {
     resource_id = state.resource_id,
     ended_at = timestamp(),
     output_bytes = state.output_bytes,
     output_offset = state.offset,
     history_path = state.history_path,
+    oldest_offset = state.oldest_offset,
+    newest_offset = state.newest_offset,
+    max_history_bytes = state.max_history_bytes,
+    checkpoint_path = state.checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
   }, transition_operation_id(runtime_id, "exited", service.revision), service.revision)
   if result.code == "ok" then
     state.status = "exited"
     queue_runtime_event(state, {
       type = "status", runtime_id = runtime_id, status = "exited",
       exit_code = exit_code, signal = signal, offset = state.offset,
+      oldest_offset = state.oldest_offset, newest_offset = state.newest_offset,
     })
   else
     state.status = "interrupted"
@@ -433,12 +838,18 @@ local function fail_runtime(service, runtime_id, state, message)
     pcall(function() state.runtime:close() end)
     state.runtime = nil
   end
+  write_checkpoint(state, true)
   local failed = runtime_transition(service, {}, runtime_id, "failed", {
     resource_id = state.resource_id,
     ended_at = timestamp(),
     output_bytes = state.output_bytes,
     output_offset = state.offset,
     history_path = state.history_path,
+    oldest_offset = state.oldest_offset,
+    newest_offset = state.newest_offset,
+    max_history_bytes = state.max_history_bytes,
+    checkpoint_path = state.checkpoint_path,
+    checkpoint_offset = state.checkpoint_offset,
     metadata = runtime_failure_metadata(service.runtimes[runtime_id], message),
   }, transition_operation_id(runtime_id, "failed", service.revision), service.revision)
   if failed.code == "ok" then
@@ -446,6 +857,7 @@ local function fail_runtime(service, runtime_id, state, message)
     queue_runtime_event(state, {
       type = "status", runtime_id = runtime_id, status = "failed",
       message = message, offset = state.offset,
+      oldest_offset = state.oldest_offset, newest_offset = state.newest_offset,
     })
   else
     state.status = "interrupted"
@@ -461,19 +873,40 @@ local function poll_runtimes(service, runtimes)
         fail_runtime(service, runtime_id, state, tostring(data))
       else
         if type(data) == "string" and #data > 0 then
-          local written, message = append_history(state.history_path, data)
+          local written, message = append_history(state.history_path, state, data)
           if written then
-            local offset = state.offset
-            state.offset = offset + #data
-            state.output_bytes = state.offset
+            local checkpointed, checkpoint_message = true
+            if state.emulator then
+              local fed, feed_message = pcall(function() return state.emulator:feed(data) end)
+              if not fed then checkpointed, checkpoint_message = false, tostring(feed_message) end
+            end
+            if checkpointed then
+              local checkpoint_changed, checkpoint_result
+              checkpoint_changed, checkpoint_result = write_checkpoint(state, false)
+              if not checkpoint_changed then
+                checkpointed, checkpoint_message = false, checkpoint_result
+              elseif checkpoint_result then
+                checkpointed, checkpoint_message = persist_runtime_history(
+                  service, runtime_id, state)
+              end
+            end
+            local offset = state.newest_offset - #data
             queue_runtime_event(state, {
               type = "output", runtime_id = runtime_id,
               offset = offset, data = data,
+              oldest_offset = state.oldest_offset,
+              newest_offset = state.newest_offset,
             })
+            if not checkpointed then
+              queue_runtime_event(state, {
+                type = "status", runtime_id = runtime_id, status = "error",
+                message = checkpoint_message, offset = state.newest_offset,
+              })
+            end
           else
             queue_runtime_event(state, {
               type = "status", runtime_id = runtime_id, status = "error",
-              message = message, offset = state.offset,
+              message = message, offset = state.newest_offset,
             })
           end
         end
@@ -549,6 +982,11 @@ local function handle_client_message(service, client, options, runtimes, history
   if message.kind == "close" then return false end
 
   if message.kind == "hello" then
+    local compatibility, compatibility_message = Protocol.compatibility(message)
+    if not compatibility then
+      return enqueue(client, error_message(message.request_id, "protocol_incompatible",
+        compatibility_message))
+    end
     if message.workspace_id and message.workspace_id ~= workspace_id then
       return enqueue(client, error_message(message.request_id, "workspace_mismatch",
         "requested workspace does not match the agent workspace"))
@@ -556,6 +994,8 @@ local function handle_client_message(service, client, options, runtimes, history
     return enqueue(client, Protocol.request("hello_result", message.request_id, {
       ok = true,
       workspace_id = workspace_id,
+      protocol_major = compatibility.major,
+      protocol_minor = compatibility.minor,
       revision = service.revision,
       capabilities = {
         event_replay = true,
@@ -564,6 +1004,14 @@ local function handle_client_message(service, client, options, runtimes, history
         runtimes = true,
         runtime_replay = true,
         providers = true,
+      },
+      capability_versions = {
+        event_replay = 1,
+        event_cursors = 1,
+        sqlite = 1,
+        runtimes = 1,
+        runtime_replay = 1,
+        providers = 1,
       },
       providers = service.providers:describe(),
     }))
@@ -615,6 +1063,11 @@ local function handle_client_message(service, client, options, runtimes, history
         "command is required"))
     end
     local command = message.command
+    local valid, validation_message = validation.command(command)
+    if not valid then
+      return enqueue(client, error_message(message.request_id, "invalid_command",
+        validation_message))
+    end
     local result
     if command.type == "runtime.start" then
       result = start_runtime(service, runtimes, history_directory, command)
@@ -628,6 +1081,10 @@ local function handle_client_message(service, client, options, runtimes, history
       result = resize_runtime(service, runtimes, command)
     elseif command.type == "runtime.replay" then
       result = replay_runtime(service, runtimes, command)
+    elseif command.type == "runtime.delete_history" then
+      result = delete_runtime_history(service, runtimes, history_directory, command)
+    elseif command.type == "resource.delete" or command.type == "terminal.delete" then
+      result = delete_resource(service, runtimes, history_directory, command)
     else
       result = service:execute(command)
     end
@@ -721,8 +1178,15 @@ local function reconcile_runtimes(service, runtimes)
       resource_id = persisted.resource_id,
       pending = {},
       history_path = persisted.history_path,
-      offset = persisted.output_offset or 0,
-      output_bytes = persisted.output_bytes or 0,
+      oldest_offset = persisted.oldest_offset or 0,
+      newest_offset = persisted.newest_offset or persisted.output_offset or 0,
+      max_history_bytes = persisted.max_history_bytes or DEFAULT_MAX_HISTORY_BYTES,
+      checkpoint_path = persisted.checkpoint_path
+        or (persisted.history_path and persisted.history_path .. ".checkpoint"),
+      checkpoint_offset = persisted.checkpoint_offset or 0,
+      offset = persisted.newest_offset or persisted.output_offset or 0,
+      output_bytes = persisted.output_bytes or persisted.newest_offset
+        or persisted.output_offset or 0,
       status = persisted.status,
     }
     runtimes[runtime_id] = state
@@ -736,6 +1200,11 @@ local function reconcile_runtimes(service, runtimes)
         output_bytes = state.output_bytes,
         output_offset = state.offset,
         history_path = state.history_path,
+        oldest_offset = state.oldest_offset,
+        newest_offset = state.newest_offset,
+        max_history_bytes = state.max_history_bytes,
+        checkpoint_path = state.checkpoint_path,
+        checkpoint_offset = state.checkpoint_offset,
         metadata = runtime_recovery_metadata(persisted, previous_status),
       }, transition_operation_id(runtime_id, "recovery", service.revision),
         service.revision)
@@ -764,6 +1233,7 @@ function Agent.run(options)
   local history_directory = (options.data_dir or directory or ".") .. "/workbench-runtimes"
   local history_ok, history_message = common.mkdirp(history_directory)
   assert(history_ok, history_message)
+  garbage_collect_runtime_files(service, history_directory)
   local runtimes = {}
   reconcile_runtimes(service, runtimes)
   local server, listen_message = transport.listen(options.endpoint)

@@ -1,6 +1,7 @@
 local test = require "core.test"
 local MessagePack = require "plugins.workbench.service.msgpack"
 local Protocol = require "plugins.workbench.service.protocol"
+local Validation = require "plugins.workbench.service.validation"
 
 test.describe("Workbench protocol", function()
   test.test("round-trips deterministic control messages", function()
@@ -56,6 +57,24 @@ test.describe("Workbench protocol", function()
     test.equal(decoded.commands[1].type, "workspace.rename")
   end)
 
+  test.test("enforces privileged command limits before transport", function()
+    local valid, message = Validation.command {
+      type = "runtime.input", runtime_id = "runtime-1",
+      data = string.rep("x", Validation.limits.input_bytes + 1),
+    }
+    test.equal(valid, nil)
+    test.contains(message, "maximum length")
+
+    local ok = pcall(Protocol.encode, {
+      kind = "command", request_id = "bounded-command",
+      command = {
+        type = "runtime.resize", runtime_id = "runtime-1",
+        columns = Validation.limits.terminal_columns + 1, rows = 24,
+      },
+    })
+    test.equal(ok, false)
+  end)
+
   test.test("validates event cursor messages", function()
     local frame = Protocol.encode {
       kind = "subscribe",
@@ -75,5 +94,20 @@ test.describe("Workbench protocol", function()
     local ok, error_message = pcall(Protocol.encode, message)
     test.equal(ok, false)
     test.ok(tostring(error_message):match("non%-negative integer"))
+  end)
+
+  test.test("negotiates a compatible minor protocol and rejects a major mismatch", function()
+    local compatibility = assert(Protocol.compatibility {
+      protocol_major = Protocol.major,
+      protocol_minor = 99,
+    })
+    test.equal(compatibility.major, Protocol.major)
+    test.equal(compatibility.minor, Protocol.minor)
+    local incompatible, message = Protocol.compatibility {
+      protocol_major = Protocol.major + 1,
+      protocol_minor = 0,
+    }
+    test.equal(incompatible, nil)
+    test.contains(message, "major")
   end)
 end)

@@ -425,6 +425,7 @@ function Service:_create_collection(command, changes)
     entity_id = id,
     parent_id = parent_id,
     title = value.title,
+    record = copy(self.collections[id]),
   }
   return {entity_id = id}
 end
@@ -459,6 +460,7 @@ function Service:_update_collection(command, changes)
     parent_id = collection.parent_id,
     title = collection.title,
     order = collection.order,
+    record = copy(collection),
   }
   return {entity_id = id}
 end
@@ -473,6 +475,7 @@ function Service:_archive_collection(command, changes)
     entity_type = "collection",
     entity_id = id,
     archived = collection.archived,
+    record = copy(collection),
   }
   return {entity_id = id}
 end
@@ -481,6 +484,7 @@ function Service:_delete_collection(command, changes)
   local id = command.collection_id or command.id
   local collection, error_result = self:_require_record(self.collections, id, "collection")
   if not collection then return nil, error_result.message end
+  local deleted_record = copy(collection)
   self.collections[id] = nil
   for _, child in pairs(self.collections) do
     if child.parent_id == id then
@@ -492,19 +496,38 @@ function Service:_delete_collection(command, changes)
         parent_id = "root",
         title = child.title,
         order = child.order,
+        record = copy(child),
       }
     end
   end
   for _, task in pairs(self.tasks) do
-    if task.collection_id == id then task.collection_id = nil end
+    if task.collection_id == id then
+      task.collection_id = nil
+      changes[#changes + 1] = {
+        type = "task.moved",
+        entity_type = "task",
+        entity_id = task.id,
+        collection_id = nil,
+        record = copy(task),
+      }
+    end
   end
   for _, resource in pairs(self.resources) do
-    if resource.collection_id == id then resource.collection_id = nil end
+    if resource.collection_id == id then
+      resource.collection_id = nil
+      changes[#changes + 1] = {
+        type = "resource.updated",
+        entity_type = "resource",
+        entity_id = resource.id,
+        record = copy(resource),
+      }
+    end
   end
   changes[#changes + 1] = {
     type = "collection.deleted",
     entity_type = "collection",
     entity_id = id,
+    record = deleted_record,
   }
   return {entity_id = id}
 end
@@ -533,6 +556,7 @@ function Service:_create_task(command, changes)
     entity_type = "task",
     entity_id = id,
     title = value.title,
+    record = copy(self.tasks[id]),
   }
   return {entity_id = id}
 end
@@ -570,6 +594,7 @@ function Service:_update_task(command, changes)
     collection_id = task.collection_id,
     status = task.status,
     order = task.order,
+    record = copy(task),
   }
   return {entity_id = id}
 end
@@ -584,6 +609,7 @@ function Service:_archive_task(command, changes)
     entity_type = "task",
     entity_id = id,
     archived = task.archived,
+    record = copy(task),
   }
   return {entity_id = id}
 end
@@ -592,11 +618,13 @@ function Service:_delete_task(command, changes)
   local id = command.task_id or command.id
   local task, error_result = self:_require_record(self.tasks, id, "task")
   if not task then return nil, error_result.message end
+  local deleted_record = copy(task)
   self.tasks[id] = nil
   changes[#changes + 1] = {
     type = "task.deleted",
     entity_type = "task",
     entity_id = id,
+    record = deleted_record,
   }
   return {entity_id = id}
 end
@@ -643,6 +671,7 @@ function Service:_create_resource(command, changes)
     kind = kind,
     provider = value.provider,
     title = value.title,
+    record = copy(self.resources[id]),
   }
   return {entity_id = id}
 end
@@ -704,6 +733,7 @@ function Service:_update_resource(command, changes)
     status = resource.status,
     cols = resource.cols,
     rows = resource.rows,
+    record = copy(resource),
   }
   return {entity_id = id}
 end
@@ -736,20 +766,34 @@ function Service:_update_runtime(command, changes)
   end
 
   for _, field in ipairs {
-    "status", "started_at", "ended_at", "history_path"
+    "status", "started_at", "ended_at", "history_path", "checkpoint_path",
+    "provider", "external_session_id"
   } do
     if value[field] ~= nil then runtime[field] = value[field] end
   end
   for _, field in ipairs {
-    "pid", "output_bytes", "output_offset"
+    "pid", "output_bytes", "output_offset", "oldest_offset", "newest_offset",
+    "max_history_bytes", "checkpoint_offset"
   } do
     if value[field] ~= nil then
       ok, message = valid_field(validation.integer, value[field], "runtime." .. field)
       if not ok then return nil, message end
+      if (field == "oldest_offset" or field == "newest_offset"
+          or field == "checkpoint_offset")
+          and value[field] < 0 then
+        return nil, "runtime." .. field .. " must be non-negative"
+      end
+      if field == "max_history_bytes" and value[field] <= 0 then
+        return nil, "runtime.max_history_bytes must be positive"
+      end
       runtime[field] = value[field]
     end
   end
   if value.metadata ~= nil then runtime.metadata = copy(value.metadata) end
+  if value.capabilities ~= nil then runtime.capabilities = copy(value.capabilities) end
+  if value.execution_policy ~= nil then
+    runtime.execution_policy = copy(value.execution_policy)
+  end
   self.runtimes[id] = runtime
   if runtime.resource_id and self.resources[runtime.resource_id] and runtime.status then
     self.resources[runtime.resource_id].status = runtime.status
@@ -761,8 +805,39 @@ function Service:_update_runtime(command, changes)
     resource_id = runtime.resource_id,
     status = runtime.status,
     output_offset = runtime.output_offset,
+    oldest_offset = runtime.oldest_offset,
+    newest_offset = runtime.newest_offset,
+    max_history_bytes = runtime.max_history_bytes,
+    checkpoint_path = runtime.checkpoint_path,
+    checkpoint_offset = runtime.checkpoint_offset,
+    provider = runtime.provider,
+    external_session_id = runtime.external_session_id,
+    capabilities = copy(runtime.capabilities or {}),
+    execution_policy = copy(runtime.execution_policy or {}),
+    record = copy(runtime),
+    resource = runtime.resource_id and self.resources[runtime.resource_id]
+      and copy(self.resources[runtime.resource_id]) or nil,
   }
   return {runtime_id = id}
+end
+
+function Service:_delete_runtime_history(command, changes)
+  local id = command.runtime_id or command.id
+  local runtime, error_result = self:_require_record(self.runtimes, id, "runtime")
+  if not runtime then return nil, error_result.message end
+  if runtime.status == "starting" or runtime.status == "running"
+      or runtime.status == "stopping" or runtime.status == "recovering" then
+    return nil, "runtime history cannot be deleted while the runtime is active"
+  end
+  local deleted_record = copy(runtime)
+  self.runtimes[id] = nil
+  changes[#changes + 1] = {
+    type = "runtime.deleted",
+    entity_type = "runtime",
+    entity_id = id,
+    record = deleted_record,
+  }
+  return {runtime_id = id, deleted = true}
 end
 
 function Service:_update_provider_metadata(command, changes)
@@ -783,6 +858,7 @@ function Service:_update_provider_metadata(command, changes)
     type = "provider.metadata_updated",
     entity_type = "provider",
     entity_id = id,
+    record = copy(self.provider_metadata[id]),
   }
   return {provider_id = id}
 end
@@ -797,6 +873,7 @@ function Service:_archive_resource(command, changes)
     entity_type = "resource",
     entity_id = id,
     archived = resource.archived,
+    record = copy(resource),
   }
   return {entity_id = id}
 end
@@ -805,16 +882,23 @@ function Service:_delete_resource(command, changes)
   local id = command.resource_id or command.terminal_id or command.id
   local resource, error_result = self:_require_record(self.resources, id, "resource")
   if not resource then return nil, error_result.message end
-  self.resources[id] = nil
+  local deleted_record = copy(resource)
   for _, runtime in pairs(self.runtimes) do
+    if runtime.resource_id == id
+        and (runtime.status == "starting" or runtime.status == "running"
+          or runtime.status == "stopping" or runtime.status == "recovering") then
+      return nil, "resource cannot be deleted while its runtime is active"
+    end
+  end
+  self.resources[id] = nil
+  for runtime_id, runtime in pairs(self.runtimes) do
     if runtime.resource_id == id then
-      runtime.resource_id = nil
+      self.runtimes[runtime_id] = nil
       changes[#changes + 1] = {
-        type = "runtime.updated",
+        type = "runtime.deleted",
         entity_type = "runtime",
-        entity_id = runtime.id,
-        status = runtime.status,
-        output_offset = runtime.output_offset,
+        entity_id = runtime_id,
+        record = copy(runtime),
       }
     end
   end
@@ -822,6 +906,7 @@ function Service:_delete_resource(command, changes)
     type = "resource.deleted",
     entity_type = "resource",
     entity_id = id,
+    record = deleted_record,
   }
   return {entity_id = id}
 end
@@ -836,6 +921,7 @@ function Service:_rename_workspace(command, changes)
     entity_type = "workspace",
     entity_id = self.workspace_id,
     name = name,
+    record = { id = self.workspace_id, name = name },
   }
   return {entity_id = self.workspace_id}
 end
@@ -908,12 +994,13 @@ function Service:execute(command)
   elseif command_type == "runtime.update" or command_type == "runtime.start"
       or command_type == "runtime.stop" or command_type == "runtime.restart" then
     result, handler_message = self:_update_runtime(command, changes)
+  elseif command_type == "runtime.delete_history" then
+    result, handler_message = self:_delete_runtime_history(command, changes)
   elseif command_type == "provider.metadata.update" then
     result, handler_message = self:_update_provider_metadata(command, changes)
   elseif command_type == "resource.archive" then
     result, handler_message = self:_archive_resource(command, changes)
-  elseif command_type == "resource.delete" or command_type == "terminal.delete"
-      or command_type == "runtime.delete_history" then
+  elseif command_type == "resource.delete" or command_type == "terminal.delete" then
     result, handler_message = self:_delete_resource(command, changes)
   else
     return self:_error("unsupported_command",
@@ -935,9 +1022,8 @@ function Service:execute(command)
 end
 
 function Service:execute_batch(commands)
-  if type(commands) ~= "table" or #commands == 0 then
-    return self:_error("invalid_command", "command batch must not be empty")
-  end
+  local valid, validation_message = validation.batch(commands)
+  if not valid then return self:_error("invalid_command", validation_message) end
 
   local checkpoint = self:_state()
   local batch = { events = {}, results = {} }

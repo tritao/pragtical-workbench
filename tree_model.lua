@@ -27,6 +27,33 @@ local function matches_parent(record, parent_id)
   return record_parent == parent_id
 end
 
+local function upsert_record(records, by_id, record)
+  if not record or not record.id then return nil end
+  local current = by_id[record.id]
+  if current then
+    for key in pairs(current) do current[key] = nil end
+    for key, value in pairs(record) do current[key] = value end
+    return current
+  end
+  local copy = copy_record(record)
+  records[#records + 1] = copy
+  by_id[copy.id] = copy
+  return copy
+end
+
+local function remove_record(records, by_id, id)
+  if not id then return false end
+  if not by_id[id] then return false end
+  by_id[id] = nil
+  for index, record in ipairs(records) do
+    if record.id == id then
+      table.remove(records, index)
+      return true
+    end
+  end
+  return true
+end
+
 function Model.new(snapshot)
   local model = setmetatable({
     expanded = {},
@@ -40,6 +67,7 @@ end
 function Model:replace(snapshot)
   local expanded = self.expanded or {}
   self.workspace_id = snapshot.workspace_id or "default"
+  self.name = snapshot.name or self.workspace_id
   self.revision = snapshot.revision or 0
   self.collections = {}
   self.collection_by_id = {}
@@ -47,6 +75,10 @@ function Model:replace(snapshot)
   self.task_by_id = {}
   self.terminals = {}
   self.terminal_by_id = {}
+  self.runtimes = {}
+  self.runtime_by_id = {}
+  self.provider_metadata = {}
+  self.provider_metadata_by_id = {}
   self.expanded = expanded
   self.needs_snapshot = false
 
@@ -65,6 +97,20 @@ function Model:replace(snapshot)
     self.terminals[#self.terminals + 1] = copy
     self.terminal_by_id[copy.id] = copy
   end
+  for _, runtime in ipairs(snapshot.runtimes or {}) do
+    local copy = copy_record(runtime)
+    self.runtimes[#self.runtimes + 1] = copy
+    self.runtime_by_id[copy.id] = copy
+  end
+  for _, metadata in ipairs(snapshot.provider_metadata or {}) do
+    local copy = copy_record(metadata)
+    local id = copy.provider_id or copy.id
+    if id then
+      copy.id = copy.id or id
+      self.provider_metadata[#self.provider_metadata + 1] = copy
+      self.provider_metadata_by_id[id] = copy
+    end
+  end
   self:rebuild()
 end
 
@@ -82,46 +128,68 @@ function Model:apply_event(event)
   local event_type = event.type
 
   if event_type == "collection.created" then
-    if not self.collection_by_id[event.entity_id] then
-      local collection = {
-        id = event.entity_id,
-        parent_id = event.parent_id or "root",
-        title = event.title or "",
-        order = #self.collections
-      }
-      self.collections[#self.collections + 1] = collection
-      self.collection_by_id[collection.id] = collection
-    end
-  elseif event_type == "collection.updated" then
-    local collection = self.collection_by_id[event.entity_id]
-    if collection then
-      collection.title = event.title or collection.title
-    else
-      self.needs_snapshot = true
-    end
-  elseif event_type == "collection.moved" then
-    local collection = self.collection_by_id[event.entity_id]
-    if collection then
-      collection.parent_id = event.parent_id or "root"
-    else
+    upsert_record(self.collections, self.collection_by_id, event.record or {
+      id = event.entity_id, parent_id = event.parent_id or "root",
+      title = event.title or "", order = #self.collections,
+    })
+  elseif event_type == "collection.updated" or event_type == "collection.moved"
+      or event_type == "collection.archived" then
+    if not upsert_record(self.collections, self.collection_by_id, event.record) then
       self.needs_snapshot = true
     end
   elseif event_type == "collection.deleted" then
-    self.needs_snapshot = true
-  elseif event_type == "collection.archived" then
-    -- The compact event does not carry the new archived value. Refresh so
-    -- both archive and unarchive remain correct.
-    self.needs_snapshot = true
-  elseif event_type == "task.created"
-      or event_type == "task.updated"
-      or event_type == "task.moved"
-      or event_type == "task.archived"
-      or event_type == "task.deleted"
-      or event_type == "resource.created"
-      or event_type == "resource.updated"
-      or event_type == "resource.deleted"
+    remove_record(self.collections, self.collection_by_id, event.entity_id)
+  elseif event_type == "task.created" then
+    upsert_record(self.tasks, self.task_by_id, event.record or {
+      id = event.entity_id, title = event.title or "", order = #self.tasks,
+    })
+  elseif event_type == "task.updated" or event_type == "task.moved"
+      or event_type == "task.archived" then
+    if not upsert_record(self.tasks, self.task_by_id, event.record) then
+      self.needs_snapshot = true
+    end
+  elseif event_type == "task.deleted" then
+    remove_record(self.tasks, self.task_by_id, event.entity_id)
+  elseif event_type == "resource.created" then
+    local resource = upsert_record(self.terminals, self.terminal_by_id, event.record or {
+      id = event.entity_id, kind = event.kind or "terminal",
+      provider = event.provider, title = event.title or "", status = "stopped",
+    })
+    if resource and resource.kind ~= "terminal" then
+      remove_record(self.terminals, self.terminal_by_id, resource.id)
+    end
+  elseif event_type == "resource.updated" or event_type == "resource.archived"
       or event_type == "runtime.status_changed" then
-    self.needs_snapshot = true
+    local resource = event.record
+    if not resource or not resource.id then
+      self.needs_snapshot = true
+    elseif resource.kind == "terminal" then
+      upsert_record(self.terminals, self.terminal_by_id, resource)
+    else
+      remove_record(self.terminals, self.terminal_by_id, resource.id)
+    end
+  elseif event_type == "resource.deleted" then
+    remove_record(self.terminals, self.terminal_by_id, event.entity_id)
+  elseif event_type == "runtime.updated" then
+    if not upsert_record(self.runtimes, self.runtime_by_id, event.record) then
+      self.needs_snapshot = true
+    end
+    if event.resource then
+      upsert_record(self.terminals, self.terminal_by_id, event.resource)
+    elseif event.resource_id and self.terminal_by_id[event.resource_id] then
+      self.terminal_by_id[event.resource_id].status = event.status
+    end
+  elseif event_type == "runtime.deleted" then
+    remove_record(self.runtimes, self.runtime_by_id, event.entity_id)
+  elseif event_type == "provider.metadata_updated" then
+    local metadata = event.record and copy_record(event.record)
+    if metadata then metadata.id = metadata.id or metadata.provider_id end
+    if not upsert_record(self.provider_metadata, self.provider_metadata_by_id,
+        metadata) then
+      self.needs_snapshot = true
+    end
+  elseif event_type == "workspace.renamed" then
+    self.name = event.name or (event.record and event.record.name) or self.name
   else
     self.needs_snapshot = true
   end

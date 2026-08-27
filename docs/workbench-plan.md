@@ -248,8 +248,10 @@ generated C and Lua representations.
 
 MessagePack is not schema-less. Define explicit Lua schemas for every command,
 result, and event, including required fields, optional fields, size limits,
-unknown-field behavior, and capability negotiation. Maintain a protocol-major
-version and golden fixtures.
+unknown-field behavior, and capability negotiation. Keep the protocol major
+strict, negotiate the minor version, and publish per-capability versions so
+providers can evolve without forcing an unrelated wire break. Maintain
+golden fixtures.
 
 Terminal output carries a runtime ID, byte offset, and raw byte payload. Use
 ordinary MessagePack first; introduce specialized binary terminal frames only

@@ -59,19 +59,29 @@ function WorkbenchTerminalView:set_status(status)
   if self.runtime_state.status == lifecycle_status then
     return true
   end
-  local ok, result = pcall(function()
-    return self.client:execute {
-      type = "terminal.status",
-      operation_id = next_operation_id(self.terminal_id),
-      terminal_id = self.terminal_id,
-      status = lifecycle_status
-    }
-  end)
-  if not ok or result.code ~= "ok" then
-    return false, ok and (result.message or result.code) or result
+  if type(self.client.execute_async) ~= "function" then
+    return false, "Workbench client does not support asynchronous commands"
   end
   self.runtime_state.status = lifecycle_status
-  return true
+  local request, message = self.client:execute_async({
+    type = "terminal.status",
+    operation_id = next_operation_id(self.terminal_id),
+    terminal_id = self.terminal_id,
+    status = lifecycle_status
+  }, function(result, error_result)
+    if error_result or not result or result.code ~= "ok" then
+      self.session_error = error_result
+        or (result and (result.message or result.code))
+        or "Workbench terminal status update failed"
+      return
+    end
+    self.session_error = nil
+  end, { refresh_snapshot = false })
+  if not request then
+    self.runtime_state.status = nil
+    return false, message and (message.message or message.code) or message
+  end
+  return true, request
 end
 
 function WorkbenchTerminalView:spawn()

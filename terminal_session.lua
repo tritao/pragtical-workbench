@@ -13,6 +13,10 @@ local function operation_id(resource_id, suffix)
 end
 
 local function call_runtime(client, method, runtime_id, ...)
+  local asynchronous = client[method .. "_async"]
+  if type(asynchronous) == "function" then
+    return asynchronous(client, runtime_id, ...)
+  end
   local implementation = client[method]
   if type(implementation) == "function" then
     return implementation(client, runtime_id, ...)
