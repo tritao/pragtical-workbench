@@ -139,21 +139,29 @@ local function runtime_recovery_metadata(runtime, previous_status)
   return metadata
 end
 
-local function runtime_options(resource, command)
-  local config = resource.config or {}
-  local shell = command.shell or command.command or config.shell or config.command
-    or os.getenv("SHELL") or "sh"
-  return {
-    command = shell,
-    shell = shell,
-    args = command.args or command.arguments or config.args or config.arguments,
-    cwd = command.cwd or config.cwd,
-    environment = command.environment or config.environment or config.env,
-    columns = command.columns or command.cols or resource.cols or config.columns or 80,
-    rows = command.rows or resource.rows or config.rows or 24,
-    scrollback_limit = command.scrollback_limit or config.scrollback_limit or 10000,
-    term = command.term or config.term or "xterm-256color",
-  }
+local function provider_action(service, command, resource_id, action)
+  local resource = service.resources[resource_id]
+  if not resource then
+    return nil, service_error(service, command, "not_found",
+      "resource not found: " .. tostring(resource_id))
+  end
+  local allowed, message = service.providers:allows(resource, action)
+  if not allowed then
+    return nil, service_error(service, command, message.code, message.message)
+  end
+  return resource
+end
+
+local function runtime_options(service, resource, command)
+  local options, message = service.providers:runtime_spec(resource, command, {
+    workspace_id = service.workspace_id,
+  })
+  if not options then return nil, message end
+  local metadata, metadata_message = service.providers:runtime_metadata(resource, options, {
+    workspace_id = service.workspace_id,
+  })
+  if not metadata then return nil, metadata_message end
+  return options, metadata
 end
 
 local function start_runtime(service, runtimes, history_directory, command, skip_preflight)
@@ -163,11 +171,8 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   local previous = not skip_preflight and preflight(service, command)
   if previous then return previous end
 
-  local resource = resource_id and service.resources[resource_id]
-  if not resource then
-    return service_error(service, command, "not_found",
-      "resource not found: " .. tostring(resource_id))
-  end
+  local resource, resource_error = provider_action(service, command, resource_id, "runtime.start")
+  if not resource then return resource_error end
   local current = runtime_state(runtimes, runtime_id)
   if current and current.runtime then
     return {
@@ -184,7 +189,10 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     return service_error(service, command, "storage_error", history_message)
   end
 
-  local options = runtime_options(resource, command)
+  local options, provider_metadata = runtime_options(service, resource, command)
+  if not options then
+    return service_error(service, command, provider_metadata.code, provider_metadata.message)
+  end
   local state = current or {
     id = runtime_id,
     resource_id = resource_id,
@@ -202,7 +210,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     output_bytes = offset,
     output_offset = offset,
     history_path = history_path,
-    metadata = { shell = options.command },
+    metadata = provider_metadata,
   }, transition_operation_id(runtime_id, "starting", service.revision),
     command.expected_revision)
   if starting.code ~= "ok" then
@@ -240,7 +248,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     output_bytes = state.output_bytes,
     output_offset = state.offset,
     history_path = history_path,
-    metadata = { shell = options.command },
+    metadata = provider_metadata,
   }, operation_id, service.revision)
   if result.code ~= "ok" then
     pcall(function() state.runtime:close() end)
@@ -280,6 +288,10 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
     }
     runtimes[runtime_id] = state
   end
+
+  local resource, resource_error = provider_action(service, command, state.resource_id,
+    "runtime.stop")
+  if not resource then return resource_error end
 
   local stopping = runtime_transition(service, command, runtime_id, "stopping", {
     resource_id = state.resource_id,
@@ -338,11 +350,14 @@ local function restart_runtime(service, runtimes, history_directory, command)
   return start_runtime(service, runtimes, history_directory, start_command, true)
 end
 
-local function resize_runtime(runtimes, command)
+local function resize_runtime(service, runtimes, command)
   local state = runtime_state(runtimes, command.runtime_id)
   if not state or not state.runtime then
     return { code = "runtime_not_running", message = "runtime is not running" }
   end
+  local resource, resource_error = provider_action(service, command, state.resource_id,
+    "runtime.resize")
+  if not resource then return resource_error end
   local ok, message = pcall(function()
     state.runtime:resize(command.columns or command.cols, command.rows)
   end)
@@ -350,11 +365,14 @@ local function resize_runtime(runtimes, command)
   return { code = "ok", runtime_id = command.runtime_id }
 end
 
-local function input_runtime(runtimes, command)
+local function input_runtime(service, runtimes, command)
   local state = runtime_state(runtimes, command.runtime_id)
   if not state or not state.runtime then
     return { code = "runtime_not_running", message = "runtime is not running" }
   end
+  local resource, resource_error = provider_action(service, command, state.resource_id,
+    "runtime.input")
+  if not resource then return resource_error end
   local ok, written = pcall(function()
     return state.runtime:write(command.data or "")
   end)
@@ -365,6 +383,10 @@ end
 local function replay_runtime(service, runtimes, command)
   local state = runtime_state(runtimes, command.runtime_id)
   local persisted = service.runtimes[command.runtime_id]
+  local resource_id = state and state.resource_id or persisted and persisted.resource_id
+  local resource, resource_error = provider_action(service, command, resource_id,
+    "runtime.replay")
+  if not resource then return resource_error end
   local path = state and state.history_path or persisted and persisted.history_path
   if not path then
     return { code = "runtime_not_found", message = "runtime history is not available" }
@@ -541,7 +563,9 @@ local function handle_client_message(service, client, options, runtimes, history
         sqlite = true,
         runtimes = true,
         runtime_replay = true,
+        providers = true,
       },
+      providers = service.providers:describe(),
     }))
   elseif message.kind == "snapshot" then
     return enqueue(client, Protocol.request("snapshot", message.request_id, {
@@ -599,9 +623,9 @@ local function handle_client_message(service, client, options, runtimes, history
     elseif command.type == "runtime.stop" then
       result = stop_runtime(service, runtimes, command)
     elseif command.type == "runtime.input" then
-      result = input_runtime(runtimes, command)
+      result = input_runtime(service, runtimes, command)
     elseif command.type == "runtime.resize" then
-      result = resize_runtime(runtimes, command)
+      result = resize_runtime(service, runtimes, command)
     elseif command.type == "runtime.replay" then
       result = replay_runtime(service, runtimes, command)
     else

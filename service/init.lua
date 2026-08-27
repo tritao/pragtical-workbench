@@ -1,5 +1,6 @@
 local validation = require "plugins.workbench.service.validation"
 local MessagePack = require "plugins.workbench.service.msgpack"
+local ProviderRegistry = require "plugins.workbench.provider"
 
 local Service = {}
 Service.__index = Service
@@ -183,6 +184,7 @@ function Service.new(options)
     event_sequence = 0,
     event_limit = event_limit,
     operation_limit = operation_limit,
+    providers = options.providers or ProviderRegistry.default(),
     store = options.store,
   }, Service)
   if persisted then
@@ -360,6 +362,7 @@ function Service:snapshot()
     terminals = terminals,
     runtimes = sorted_records(self.runtimes),
     provider_metadata = sorted_records(self.provider_metadata),
+    providers = self.providers:describe(),
     event_cursor = self.event_sequence,
   }
 end
@@ -601,6 +604,11 @@ end
 function Service:_create_resource(command, changes)
   local value = payload(command, "resource")
   if command.terminal then value = merge(value, command.terminal) end
+  local normalized, provider_message = self.providers:create_resource(value, {
+    workspace_id = self.workspace_id,
+  })
+  if not normalized then return nil, provider_message end
+  value = merge(value, normalized)
   local id = value.id or self:_next_id("resource")
   local ok, message = valid_field(validation.id, id, "resource.id")
   if not ok then return nil, message end
@@ -633,6 +641,7 @@ function Service:_create_resource(command, changes)
     entity_type = "resource",
     entity_id = id,
     kind = kind,
+    provider = value.provider,
     title = value.title,
   }
   return {entity_id = id}
@@ -644,6 +653,11 @@ function Service:_update_resource(command, changes)
   local id = value.resource_id or value.terminal_id or value.id
   local resource, error_result = self:_require_record(self.resources, id, "resource")
   if not resource then return nil, error_result.message end
+  local normalized, provider_message = self.providers:update_resource(resource, value, {
+    workspace_id = self.workspace_id,
+  })
+  if not normalized then return nil, provider_message end
+  value = merge(value, normalized)
   local changed = false
   if value.title ~= nil then
     local ok, message = valid_field(validation.title, value.title, "resource.title")
@@ -685,6 +699,7 @@ function Service:_update_resource(command, changes)
     entity_type = "resource",
     entity_id = id,
     kind = resource.kind,
+    provider = resource.provider,
     title = resource.title,
     status = resource.status,
     cols = resource.cols,
@@ -756,6 +771,10 @@ function Service:_update_provider_metadata(command, changes)
   local ok, message = valid_field(validation.id, id, "provider.id")
   if not ok then return nil, message end
   if value.metadata == nil then return nil, "provider metadata is required" end
+  ok, message = self.providers:validate_metadata(id, value.metadata, {
+    workspace_id = self.workspace_id,
+  })
+  if not ok then return nil, message end
   self.provider_metadata[id] = {
     provider_id = id,
     metadata = copy(value.metadata),

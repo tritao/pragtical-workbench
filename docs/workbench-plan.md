@@ -401,8 +401,12 @@ polish.
 
 ### Phase 8 — Providers
 
-Add providers after resources, terminal lifecycle, and parity between
-in-process and agent backends are working.
+The trusted service-provider registry is implemented after resources, terminal
+lifecycle, and parity between in-process and agent backends. Providers declare
+resource kinds, capabilities, actions, and events, and implement resource
+normalization, runtime specifications, runtime metadata, and metadata
+validation. `builtin.shell` is the initial provider; Codex/OpenCode and
+Pragtical UI adapters remain follow-up providers.
 
 ## Milestones and acceptance criteria
 

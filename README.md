@@ -64,6 +64,20 @@ completed from `poll()`. The callback form is shared by the agent and
 in-process backends; the no-callback form remains a bounded synchronous
 convenience wrapper.
 
+## Providers
+
+Providers are trusted service modules registered with Workbench. Each provider
+declares its resource kinds, capabilities, supported actions, and event types,
+and implements resource creation/update validation, runtime specification,
+runtime metadata, and provider metadata validation. The built-in
+`builtin.shell` provider owns terminal resources and native PTY launch options;
+the generic Workbench records do not contain provider-specific fields.
+
+Clients can inspect the registered provider contract through
+`client:providers()` or the `providers` field in a snapshot. Provider runtime
+actions are checked by the agent before execution, so a future provider can
+expose resources without implicitly receiving shell/runtime behavior.
+
 ## Sidebar behavior
 
 Workbench shares Pragtical's single left sidebar slot with Files. By default,

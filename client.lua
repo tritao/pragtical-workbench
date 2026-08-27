@@ -583,6 +583,11 @@ function Client:snapshot()
   return self.handle:snapshot()
 end
 
+function Client:providers()
+  local snapshot = self:snapshot()
+  return snapshot and snapshot.providers or {}
+end
+
 function Client:execute_async(command, callback, options)
   options = options or {}
   if callback ~= nil and type(callback) ~= "function" then

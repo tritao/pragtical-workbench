@@ -45,6 +45,7 @@ test.describe("Workbench agent client", function()
     test.equal(client:snapshot().revision, 1)
     test.equal(#events, 1)
     test.equal(events[1].type, "collection.created")
+    test.equal(client:providers()[1].id, "builtin.shell")
 
     local resource = client:execute {
       type = "resource.create",
