@@ -33,6 +33,18 @@ local DEFAULT_MAX_HISTORY_BYTES = 16 * 1024 * 1024
 local DEFAULT_CHECKPOINT_INTERVAL_BYTES = 256 * 1024
 local MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024
 
+-- This is deliberately controlled only through the agent process environment.
+-- It gives the integration suite a deterministic way to terminate the agent
+-- immediately after a lifecycle boundary, without making the production
+-- protocol or domain model aware of test controls.
+local function crash_at_boundary(service, boundary)
+  if not service or service._fault_boundary ~= boundary then return end
+  -- os.exit does not return. The second argument is supported by Lua 5.2+
+  -- and ignored by Lua 5.1/LuaJIT, leaving the SQLite process in the same
+  -- abrupt-exit condition that the crash-recovery tests need.
+  os.exit(137, false)
+end
+
 local function history_file_size(path)
   local file, message = io.open(path, "ab")
   if not file then return nil, message end
@@ -501,6 +513,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     runtimes[runtime_id] = current
     return starting
   end
+  crash_at_boundary(service, "after_starting_commit")
 
   local ok, native_or_message = pcall(runtime_native.new, options)
   if not ok then
@@ -531,7 +544,9 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   end
 
   state.runtime = native_or_message
+  crash_at_boundary(service, "after_process_creation")
   state.started_at = timestamp()
+  crash_at_boundary(service, "before_running_commit")
   local result = runtime_transition(service, command, runtime_id, "running", {
     resource_id = resource_id,
     started_at = state.started_at,
@@ -545,6 +560,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
     checkpoint_offset = state.checkpoint_offset,
     metadata = provider_metadata,
   }, operation_id, service.revision)
+  if result.code == "ok" then crash_at_boundary(service, "after_running_commit") end
   if result.code ~= "ok" then
     pcall(function() state.runtime:close() end)
     state.runtime = nil
@@ -612,8 +628,10 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
     skip_preflight and service.revision or command.expected_revision)
   if stopping.code ~= "ok" then return stopping end
   state.status = "stopping"
+  crash_at_boundary(service, "after_stopping_commit")
 
   if state.runtime then
+    crash_at_boundary(service, "during_close")
     local closed, close_message = pcall(function() return state.runtime:close() end)
     if not closed or close_message == false then
       state.status = "failed"
@@ -637,6 +655,7 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
   -- Checkpoint after the final output has been appended, before persisting the
   -- stopped transition. A failed checkpoint is recoverable from history.
   write_checkpoint(state, true)
+  crash_at_boundary(service, "before_stopped_commit")
 
   local result = runtime_transition(service, command, runtime_id, "stopped", {
     resource_id = state.resource_id,
@@ -650,6 +669,7 @@ local function stop_runtime(service, runtimes, command, skip_preflight)
     checkpoint_path = state.checkpoint_path,
     checkpoint_offset = state.checkpoint_offset,
   }, operation_id, service.revision)
+  if result.code == "ok" then crash_at_boundary(service, "after_stopped_commit") end
   if result.code == "ok" then state.status = "stopped" end
   return result
 end
@@ -1216,6 +1236,9 @@ end
 
 function Agent.run(options)
   options = options or {}
+  if options.fault_boundary == nil and os and os.getenv then
+    options.fault_boundary = os.getenv("WORKBENCH_AGENT_FAULT_BOUNDARY")
+  end
   assert(type(options.endpoint) == "string", "Workbench agent endpoint is required")
   assert(type(options.storage_path) == "string", "Workbench agent storage path is required")
   local directory = options.endpoint:match("^(.+)[/\\][^/\\]+$")
@@ -1230,6 +1253,7 @@ function Agent.run(options)
     store = store,
     event_limit = options.event_limit,
   }
+  service._fault_boundary = options.fault_boundary
   local history_directory = (options.data_dir or directory or ".") .. "/workbench-runtimes"
   local history_ok, history_message = common.mkdirp(history_directory)
   assert(history_ok, history_message)

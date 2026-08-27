@@ -194,6 +194,13 @@ end
 
 local function apply_agent_event(snapshot, event)
   if not snapshot or type(event) ~= "table" then return false end
+  -- An idempotent retry can return an event from before the agent restarted
+  -- and reconciled the runtime. Never let that older event overwrite the
+  -- recovered projection or move its revision backwards.
+  if event.revision and snapshot.revision
+      and event.revision < snapshot.revision then
+    return false
+  end
   local event_type = event.type
   local id = event.entity_id
   local record = event.record
@@ -258,8 +265,12 @@ local function apply_agent_event(snapshot, event)
   end
 
   if applied then
-    snapshot.revision = event.revision or snapshot.revision
-    snapshot.event_cursor = event.event_sequence or snapshot.event_cursor
+    if event.revision then
+      snapshot.revision = math.max(snapshot.revision or 0, event.revision)
+    end
+    if event.event_sequence then
+      snapshot.event_cursor = math.max(snapshot.event_cursor or 0, event.event_sequence)
+    end
   end
   return applied
 end
