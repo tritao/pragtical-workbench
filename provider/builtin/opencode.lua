@@ -208,12 +208,13 @@ local function make_spec(resource, command, metadata)
     title = command.title or config.title or resource.title,
     prompt = command.prompt or config.prompt,
     external_session_id = command.external_session_id or metadata.external_session_id,
+    last_event_id = command.last_event_id or metadata.last_event_id,
     execution_policy = policy,
   }
   return result
 end
 
-local function provider_metadata(spec, session_id)
+local function provider_metadata(spec, session_id, last_event_id)
   return {
     provider = OpenCode.id,
     provider_version = OpenCode.version,
@@ -224,6 +225,7 @@ local function provider_metadata(spec, session_id)
     model = spec.model,
     agent = spec.agent,
     external_session_id = session_id or spec.external_session_id,
+    last_event_id = last_event_id or spec.last_event_id,
     execution_policy = copy(spec.execution_policy),
   }
 end
@@ -362,7 +364,7 @@ function OpenCode.runtime_spec(resource, command)
 end
 
 function OpenCode.runtime_metadata(_, spec)
-  return provider_metadata(spec)
+  return provider_metadata(spec, nil, spec.last_event_id)
 end
 
 function OpenCode.validate_metadata(metadata)
@@ -372,6 +374,9 @@ function OpenCode.validate_metadata(metadata)
   end
   if metadata.external_session_id ~= nil and type(metadata.external_session_id) ~= "string" then
     return invalid("provider metadata.external_session_id must be a string")
+  end
+  if metadata.last_event_id ~= nil and type(metadata.last_event_id) ~= "string" then
+    return invalid("provider metadata.last_event_id must be a string")
   end
   return true
 end
@@ -405,12 +410,13 @@ local function new_runtime(resource, spec, context, session_id)
     client = client,
     spec = spec,
     external_session_id = session_id,
+    last_event_id = spec.last_event_id,
     parts = {},
     pending_inputs = {},
     pending_permissions = {},
     phase = session_id and "attach" or "health",
     startup_polls = session_id and 0 or 20,
-    metadata = provider_metadata(spec, session_id),
+    metadata = provider_metadata(spec, session_id, spec.last_event_id),
     closed = false,
   }
   local process, process_owner, process_key = server_process(runtime, context, spec)
@@ -456,6 +462,10 @@ function OpenCode.stop(_, runtime)
   if type(runtime) ~= "table" then return failure("provider_contract", "invalid OpenCode runtime") end
   if runtime.closed then return true end
   runtime.closed = true
+  if runtime.request and runtime.request.value and runtime.request.value.cancel then
+    pcall(function() runtime.request.value:cancel("OpenCode runtime stopped") end)
+  end
+  runtime.request = nil
   if runtime.event_stream and runtime.event_stream.close then
     pcall(function() runtime.event_stream:close() end)
   end
@@ -475,6 +485,14 @@ function OpenCode.stop(_, runtime)
       end
     end
   end
+  return true
+end
+
+local function open_event_stream(runtime)
+  local stream, message = runtime.client:stream("/event", runtime.last_event_id)
+  if not stream then return nil, message end
+  runtime.event_stream = stream
+  runtime.phase = "streaming"
   return true
 end
 
@@ -519,7 +537,7 @@ function OpenCode.refresh_status(_, runtime)
           return failure("provider_backend_unavailable", "OpenCode did not return a session ID")
         end
         runtime.external_session_id = id
-        runtime.metadata = provider_metadata(runtime.spec, id)
+        runtime.metadata = provider_metadata(runtime.spec, id, runtime.last_event_id)
         runtime.phase = "events"
       elseif tag == "attach" then
         runtime.phase = "events"
@@ -549,16 +567,31 @@ function OpenCode.refresh_status(_, runtime)
         "/session/" .. runtime.external_session_id, nil, "attach")
       if not ok then return failure("provider_backend_unavailable", message) end
     elseif runtime.phase == "events" then
-      local stream, message = runtime.client:stream("/event")
-      if not stream then return failure("provider_backend_unavailable", message) end
-      runtime.event_stream = stream
-      runtime.phase = "streaming"
+      local ok, message = open_event_stream(runtime)
+      if not ok then return failure("provider_backend_unavailable", message) end
     elseif runtime.phase == "streaming" then
       if runtime.event_stream then
         local ok, events, message = runtime.event_stream:poll()
-        if ok == false then return failure("provider_backend_unavailable", message) end
+        if ok == false then
+          if type(runtime.event_stream.event_id) == "function" then
+            runtime.last_event_id = runtime.event_stream:event_id() or runtime.last_event_id
+          end
+          runtime.metadata = provider_metadata(runtime.spec, runtime.external_session_id,
+            runtime.last_event_id)
+          pcall(function() runtime.event_stream:close() end)
+          runtime.event_stream = nil
+          runtime.phase = "events"
+          return { status = "running", output = table.concat(output) }
+        end
         if ok == true then
-          for _, event in ipairs(events or {}) do process_event(runtime, event, output) end
+          for _, event in ipairs(events or {}) do
+            if event.id then
+              runtime.last_event_id = event.id
+              runtime.metadata = provider_metadata(runtime.spec, runtime.external_session_id,
+                runtime.last_event_id)
+            end
+            process_event(runtime, event, output)
+          end
         end
       end
       if runtime.error then return failure("provider_remote_error", runtime.error) end
