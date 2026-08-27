@@ -49,6 +49,17 @@ local function default_storage_path(workspace_id)
     .. safe_path_component(workspace_id) .. PATHSEP .. "workbench.sqlite3"
 end
 
+local function default_agent_endpoint(data_dir, workspace_id)
+  if PLATFORM ~= "Windows" and type(os) == "table" and type(os.getenv) == "function" then
+    local runtime_dir = os.getenv("XDG_RUNTIME_DIR")
+    if type(runtime_dir) == "string" and runtime_dir ~= "" then
+      return runtime_dir .. PATHSEP .. "pragtical" .. PATHSEP .. "workbench"
+        .. PATHSEP .. safe_path_component(workspace_id) .. ".sock"
+    end
+  end
+  return data_dir .. PATHSEP .. "workbench.sock"
+end
+
 local function file_exists(path)
   local info = path and system.get_file_info(path)
   return info and info.type == "file"
@@ -494,7 +505,7 @@ function Client.open(options)
       return nil, "Workbench agent storage path is unavailable"
     end
     local data_dir = options.data_dir or path_directory(storage_path, USERDIR or ".")
-    local endpoint = options.endpoint or (data_dir .. PATHSEP .. "workbench.sock")
+    local endpoint = options.endpoint or default_agent_endpoint(data_dir, workspace_id)
     local connection, connect_message = connect_or_start_agent(options, endpoint,
       data_dir, storage_path, workspace_id)
     if not connection then

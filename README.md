@@ -35,10 +35,14 @@ workbench-agent --data-root /path/to/pragtical/data \
 ```
 
 The client selects it with `backend = "agent"` and the same `endpoint`.
-The agent is a single Lua authority serving multiple clients. Its current
+When no endpoint is supplied on POSIX, the client uses
+`$XDG_RUNTIME_DIR/pragtical/workbench/<workspace>.sock`; explicit endpoints
+must be in a user-owned, non-group-writable directory. The agent is a single
+Lua authority serving multiple clients. Its current
 vertical slice supports SQLite-backed workspace commands,
 snapshots, event subscriptions, replay recovery, reconnect, POSIX PTY ownership,
-bounded output queues, byte-offset history, input, resize, and terminal replay.
+bounded per-client output queues with nonblocking drains, byte-offset history,
+input, resize, and terminal replay.
 ConPTY and Windows named-pipe transport support are now implemented in the
 native boundary; the Windows CI job now exercises the built agent, named-pipe
 transport, ConPTY terminal lifecycle, persistence, and reconnect paths.

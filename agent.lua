@@ -303,6 +303,7 @@ end
 local MAX_MESSAGES_PER_CLIENT = 64
 local MAX_OUTBOUND_MESSAGES = 1024
 local MAX_OUTBOUND_BYTES = 8 * 1024 * 1024
+local MAX_PENDING_EVENTS = 1024
 
 local function event_message(event)
   return Protocol.request("event", nil, {
@@ -318,6 +319,8 @@ local function new_client(connection)
     pending_events = {},
     outgoing = {},
     outgoing_bytes = 0,
+    write_pending = false,
+    overloaded = false,
   }
 end
 
@@ -381,7 +384,11 @@ local function handle_client_message(service, client, options, runtimes, history
     client.subscribed = true
     client.unsubscribe = service:subscribe(function(event)
       if client.subscribed and not client.closed then
-        client.pending_events[#client.pending_events + 1] = event
+        if #client.pending_events >= MAX_PENDING_EVENTS then
+          client.overloaded = true
+        else
+          client.pending_events[#client.pending_events + 1] = event
+        end
       end
     end)
     local events, replay_error = service:get_events(message.after_event_sequence or 0)
@@ -472,6 +479,20 @@ local function process_client(service, client, options, runtimes, history_direct
 end
 
 local function flush_client(client, runtime_events)
+  if client.overloaded then return nil, "Workbench client event queue limit exceeded" end
+
+  if client.write_pending then
+    local called, flushed, flush_message = pcall(function()
+      return client.connection:flush()
+    end)
+    if not called then return nil, flushed end
+    if not flushed then
+      if flush_message == "would_block" then return true end
+      return nil, flush_message or "client send failed"
+    end
+    client.write_pending = false
+  end
+
   while #client.pending_events > 0 do
     local event = table.remove(client.pending_events, 1)
     local ok, message = enqueue(client, event_message(event))
@@ -484,13 +505,24 @@ local function flush_client(client, runtime_events)
     if not ok then return nil, message end
   end
   while #client.outgoing > 0 do
-    local frame = table.remove(client.outgoing, 1)
-    client.outgoing_bytes = client.outgoing_bytes - #frame
-    local sent_ok, send_ok, send_message = pcall(function()
-      return client.connection:send(frame)
+    local frame = client.outgoing[1]
+    local called, sent, send_message = pcall(function()
+      return client.connection:send_nonblocking(frame)
     end)
-    if not sent_ok then return nil, send_ok end
-    if send_ok == false then return nil, send_message or "client send failed" end
+    if not called then return nil, sent end
+    if sent then
+      table.remove(client.outgoing, 1)
+      client.outgoing_bytes = client.outgoing_bytes - #frame
+    elseif send_message == "would_block" then
+      -- The native transport owns the partially written frame now. Remove it
+      -- from the Lua queue and let the next event-loop turn flush it.
+      table.remove(client.outgoing, 1)
+      client.outgoing_bytes = client.outgoing_bytes - #frame
+      client.write_pending = true
+      return true
+    else
+      return nil, send_message or "client send failed"
+    end
   end
   return true
 end
@@ -536,7 +568,7 @@ function Agent.run(options)
       local connection, accept_message = server:accept(options.once and -1 or 10)
       if connection then
         add_client(connection)
-      elseif accept_message == "timeout" then
+      elseif accept_message == "timeout" or accept_message == "unauthorized" then
         -- The shared event loop continues servicing existing clients below.
       else
         server:close()
@@ -550,7 +582,7 @@ function Agent.run(options)
         local extra, extra_message = server:accept(0)
         if extra then
           add_client(extra)
-        elseif extra_message == "timeout" then
+        elseif extra_message == "timeout" or extra_message == "unauthorized" then
           break
         else
           server:close()
