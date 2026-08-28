@@ -67,6 +67,27 @@ test.describe("Workbench sidebar", function()
     test.equal(restored.client.backend, "fake")
   end)
 
+  test.test("opens Workbench only for fresh or forced startup", function()
+    test.ok(Sidebar.should_open_on_startup("restore", false))
+    test.ok(not Sidebar.should_open_on_startup("restore", true))
+    test.ok(Sidebar.should_open_on_startup("always", true))
+    test.ok(not Sidebar.should_open_on_startup("never", false))
+  end)
+
+  test.test("offers useful actions for an empty workspace", function()
+    test.ok(sidebar:is_empty())
+    local actions = sidebar:get_empty_actions()
+    test.equal(#actions, 3)
+    test.equal(actions[1].label, "Open project")
+    test.equal(actions[1].command, "core:open-project-folder")
+    test.equal(actions[2].command, "workbench:create-task")
+    test.equal(actions[3].command, "workbench:create-terminal")
+
+    local task = sidebar:create_task("First task")
+    test.equal(task.code, "ok")
+    test.ok(not sidebar:is_empty())
+  end)
+
   test.test("keeps lazy providers uninitialized until requested", function()
     local created = 0
     SidebarHost:register("lazy", function()

@@ -1,4 +1,5 @@
 local core = require "core"
+local command = require "core.command"
 local common = require "core.common"
 local config = require "core.config"
 local SidebarHost = require "core.sidebar"
@@ -23,7 +24,18 @@ local empty_snapshot = function(workspace_id)
   }
 end
 
+local empty_actions = {
+  { label = "Open project", command = "core:open-project-folder" },
+  { label = "Create task", command = "workbench:create-task" },
+  { label = "New terminal", command = "workbench:create-terminal" },
+}
+
 function Sidebar:__tostring() return "Workbench" end
+
+function Sidebar.should_open_on_startup(startup, has_saved_state)
+  return startup == "always"
+    or (startup == "restore" and not has_saved_state)
+end
 
 function Sidebar:try_close(do_close)
   do_close()
@@ -49,6 +61,7 @@ function Sidebar:new(options)
   self.target_size = options.size or config.plugins.workbench.size
   self.selected_id = options.selected_id
   self.hovered_index = nil
+  self.empty_hovered_index = nil
   self.error = nil
 
   self.client, self.error = Client.open {
@@ -313,16 +326,40 @@ function Sidebar:get_item_height()
   return style.font:get_height() + style.padding.y
 end
 
+function Sidebar:is_empty()
+  return #self.model.collections == 0
+    and #self.model.tasks == 0
+    and #self.model.terminals == 0
+end
+
+function Sidebar:get_empty_actions()
+  return empty_actions
+end
+
+function Sidebar:activate_empty_action(index)
+  local action = empty_actions[index]
+  if not action then return false end
+  return command.perform(action.command)
+end
+
 function Sidebar:get_mode_bar_height()
   return style.font:get_height() + style.padding.y
 end
 
 function Sidebar:get_scrollable_size()
-  return self:get_mode_bar_height() + style.padding.y + #self.model.rows * self:get_item_height()
+  local content_height = #self.model.rows * self:get_item_height()
+  if self:is_empty() then
+    content_height = self:get_item_height() * (#empty_actions + 1)
+  end
+  return self:get_mode_bar_height() + style.padding.y + content_height
 end
 
 function Sidebar:row_at(x, y)
-  if x < self.position.x or x > self.position.x + self.size.x then return nil end
+  if self:is_empty()
+    or x < self.position.x
+    or x > self.position.x + self.size.x then
+    return nil
+  end
   local bar_height = self:get_mode_bar_height()
   if y < self.position.y + bar_height then return nil end
   local h = self:get_item_height()
@@ -331,19 +368,38 @@ function Sidebar:row_at(x, y)
   return index, self.model:get_row(index)
 end
 
+function Sidebar:empty_action_at(x, y)
+  if not self:is_empty()
+    or x < self.position.x
+    or x > self.position.x + self.size.x then
+    return nil
+  end
+  local start_y = self.position.y + self:get_mode_bar_height()
+    + style.padding.y + self:get_item_height()
+  local index = math.floor((y - start_y) / self:get_item_height()) + 1
+  if index < 1 or index > #empty_actions then return nil end
+  return index
+end
+
 function Sidebar:on_mouse_moved(x, y, dx, dy)
   local processed = Sidebar.super.on_mouse_moved(self, x, y, dx, dy)
+  local empty_index = self:empty_action_at(x, y)
   local index = self:row_at(x, y)
+  if self.empty_hovered_index ~= empty_index then
+    self.empty_hovered_index = empty_index
+    core.redraw = true
+  end
   if self.hovered_index ~= index then
     self.hovered_index = index
     core.redraw = true
   end
-  return processed or index ~= nil
+  return processed or index ~= nil or empty_index ~= nil
 end
 
 function Sidebar:on_mouse_left()
   Sidebar.super.on_mouse_left(self)
   self.hovered_index = nil
+  self.empty_hovered_index = nil
 end
 
 function Sidebar:on_mouse_wheel(y, x)
@@ -360,8 +416,15 @@ function Sidebar:on_mouse_pressed(button, x, y, clicks)
   if y >= self.position.y and y < self.position.y + bar_height then
     local files_width = style.font:get_width("Files") + style.padding.x * 2
     if x < self.position.x + files_width then
-      core.sidebar:show("files")
+      SidebarHost:show("files")
+    else
+      SidebarHost:show("workbench")
     end
+    return true
+  end
+  local empty_index = self:empty_action_at(x, y)
+  if empty_index then
+    self:activate_empty_action(empty_index)
     return true
   end
   local index, row = self:row_at(x, y)
@@ -427,23 +490,49 @@ function Sidebar:draw()
   local bar_height = self:get_mode_bar_height()
   local bar_y = self.position.y
   renderer.draw_rect(self.position.x, bar_y, self.size.x, bar_height, style.background)
-  local files_color = style.dim
-  local workbench_color = style.text
-  renderer.draw_text(style.font, "Files", self.position.x + style.padding.x,
+  local files_color = SidebarHost:is_active("files") and style.text or style.dim
+  local workbench_color = SidebarHost:is_active("workbench") and style.text or style.dim
+  local files_x = self.position.x + style.padding.x
+  local files_width = style.font:get_width("Files") + style.padding.x * 2
+  if SidebarHost:is_active("files") then
+    renderer.draw_rect(self.position.x, bar_y, files_width, bar_height, style.line_highlight)
+  end
+  renderer.draw_text(style.font, "Files", files_x,
     bar_y + style.padding.y / 2, files_color)
-  local workbench_x = self.position.x + style.padding.x
-    + style.font:get_width("Files") + style.padding.x * 2
+  local workbench_x = files_x + files_width
+  local workbench_width = style.font:get_width("Workbench") + style.padding.x * 2
+  if SidebarHost:is_active("workbench") then
+    renderer.draw_rect(self.position.x + files_width, bar_y,
+      workbench_width, bar_height, style.line_highlight)
+  end
   renderer.draw_text(style.font, "Workbench", workbench_x,
     bar_y + style.padding.y / 2, workbench_color)
   local x, y = self:get_content_offset()
   y = y + bar_height
   local h = self:get_item_height()
-  local top = self.position.y + bar_height
-  local bottom = top + self.size.y
-  for index, row in ipairs(self.model.rows) do
-    local row_y = y + (index - 1) * h + style.padding.y / 2
-    if row_y + h >= top and row_y < bottom then
-      self:draw_row(row, index, x, row_y, self.size.x, h)
+  if self:is_empty() then
+    local header_y = y + style.padding.y
+    renderer.draw_text(style.font, "No workspace items yet", x + style.padding.x,
+      header_y, style.text)
+    for index, action in ipairs(empty_actions) do
+      local action_y = header_y + h * index
+      local hovered = index == self.empty_hovered_index
+      if hovered then
+        renderer.draw_rect(self.position.x, action_y, self.size.x, h,
+          style.line_highlight)
+      end
+      renderer.draw_text(style.font, action.label, x + style.padding.x,
+        action_y + style.padding.y / 2, hovered and style.text or style.dim)
+    end
+  end
+  if not self:is_empty() then
+    local top = self.position.y + bar_height
+    local bottom = top + self.size.y
+    for index, row in ipairs(self.model.rows) do
+      local row_y = y + (index - 1) * h + style.padding.y / 2
+      if row_y + h >= top and row_y < bottom then
+        self:draw_row(row, index, x, row_y, self.size.x, h)
+      end
     end
   end
   if self.error then

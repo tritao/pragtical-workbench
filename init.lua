@@ -107,9 +107,7 @@ end
 add_toolbar_button()
 
 local startup = config.plugins.workbench.startup
-if startup == "always"
-  or (startup == "restore" and not SidebarHost:has_saved_state())
-then
+if Sidebar.should_open_on_startup(startup, SidebarHost:has_saved_state()) then
   open_view()
 end
 
