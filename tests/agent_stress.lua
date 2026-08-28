@@ -30,10 +30,8 @@ local function runtime_config()
       args = {
         "/S", "/C",
         "powershell.exe -NoProfile -NonInteractive -Command "
-          .. "\"$bytes = [byte[]]::new(" .. tostring(stress_output_bytes) .. "); "
-          .. "for ($i = 0; $i -lt $bytes.Length; $i += 4) { "
-          .. "$bytes[$i] = 27; $bytes[$i + 1] = 91; "
-          .. "$bytes[$i + 2] = 48; $bytes[$i + 3] = 109 }; "
+          .. "\"$bytes = [Text.Encoding]::ASCII.GetBytes([string]::new([char]1, "
+          .. tostring(stress_output_bytes) .. ")); "
           .. "[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length); "
           .. "Start-Sleep -Seconds 4\"",
       },
