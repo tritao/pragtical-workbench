@@ -535,6 +535,8 @@ local function start_runtime(service, runtimes, history_directory, command, skip
           state.checkpoint_bytes = #checkpoint_data
           state.emulator = emulator
         else
+          emulator_error = not restored and tostring(restore_result)
+            or "terminal emulator rejected persisted checkpoint"
           pcall(function() emulator:close() end)
         end
       else
