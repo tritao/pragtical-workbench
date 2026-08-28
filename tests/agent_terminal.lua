@@ -123,17 +123,29 @@ test.describe("Workbench agent terminal runtime", function()
       backend = "agent", endpoint = endpoint,
       workspace_id = "agent-terminal-test",
     })
+    local snapshot = second:snapshot()
     local reattached = assert(second:terminal_session("checkpoint-terminal"))
     test.ok(reattached:attach())
     local checkpoint
+    local checkpoint_error
     local deadline = system.get_time() + 2
     while not checkpoint and system.get_time() < deadline do
       for _, event in ipairs(reattached:poll_events()) do
         if event.type == "checkpoint" then checkpoint = event end
+        if event.type == "status" and event.status == "error" then
+          checkpoint_error = event.message
+        end
       end
       if not checkpoint then system.sleep(0.01) end
     end
-    test.not_nil(checkpoint)
+    local persisted
+    for _, terminal in ipairs(snapshot.terminals or {}) do
+      if terminal.id == "checkpoint-terminal" then persisted = terminal end
+    end
+    test.not_nil(checkpoint, "checkpoint missing (offset "
+      .. tostring(persisted and persisted.checkpoint_offset or "unknown")
+      .. (checkpoint_error and ", error: " .. tostring(checkpoint_error) or "")
+      .. ")")
     test.ok(reattached:apply_checkpoint(checkpoint, reattached.emulator))
     test.equal(checkpoint.offset, checkpoint.newest_offset)
     test.ok(checkpoint.offset - checkpoint.oldest_offset <= 64)
