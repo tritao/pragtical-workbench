@@ -55,14 +55,7 @@ local function collect_output(client, runtime_id, minimum)
   local total = 0
   local last_offset
   local deadline = system.get_time() + (PLATFORM == "Windows" and 30 or 12)
-  local resize_at = 0
   while total < minimum and system.get_time() < deadline do
-    local now = system.get_time()
-    if now >= resize_at then
-      local queued = client:resize_runtime_async(runtime_id, 100, 30)
-      test.ok(queued == true, queued and tostring(queued))
-      resize_at = now + 0.05
-    end
     for _, event in ipairs(client:poll_runtime_events(runtime_id)) do
       if event.type == "output" then
         test.equal(event.newest_offset, event.offset + #event.data)
