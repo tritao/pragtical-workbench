@@ -5,11 +5,12 @@ local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "",
   "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
-local function collect_output(session, seconds, expected)
+local function collect_output(session, seconds, expected, on_event)
   local output = {}
   local deadline = system.get_time() + seconds
   while system.get_time() < deadline do
     for _, event in ipairs(session:poll_events()) do
+      if on_event then on_event(event) end
       if event.type == "output" then output[#output + 1] = event.data end
     end
     if not expected or table.concat(output):find(expected, 1, true) then break end
@@ -116,7 +117,12 @@ test.describe("Workbench agent terminal runtime", function()
     test.equal(created.code, "ok")
     local session = assert(first:terminal_session("checkpoint-terminal"))
     test.ok(session:attach())
-    test.contains(collect_output(session, 2, "checkpoint-output"), "checkpoint-output")
+    local checkpoint_error
+    test.contains(collect_output(session, 2, "checkpoint-output", function(event)
+      if event.type == "status" and event.status == "error" then
+        checkpoint_error = event.message
+      end
+    end), "checkpoint-output")
     first:close()
 
     local second = assert(Client.open {
@@ -124,11 +130,11 @@ test.describe("Workbench agent terminal runtime", function()
       workspace_id = "agent-terminal-test",
     })
     local reattached = assert(second:terminal_session("checkpoint-terminal"))
-    local replay_ok, replay_result = reattached:request_replay(0)
-    test.ok(replay_ok)
     test.ok(reattached:attach())
+    local replay_ok, replay_result = second:request_runtime_output(
+      "checkpoint-terminal", 0)
+    test.ok(replay_ok)
     local checkpoint
-    local checkpoint_error
     local deadline = system.get_time() + 2
     while not checkpoint and system.get_time() < deadline do
       for _, event in ipairs(reattached:poll_events()) do
