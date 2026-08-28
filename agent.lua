@@ -8,9 +8,14 @@ local transport = require "workbench_transport"
 local runtime_native = require "workbench_runtime"
 
 local terminal_emulator
+local terminal_emulator_load_error
 do
   local loaded, module = pcall(require, "workbench_emulator")
-  if loaded then terminal_emulator = module end
+  if loaded then
+    terminal_emulator = module
+  else
+    terminal_emulator_load_error = tostring(module)
+  end
 end
 
 local Agent = {}
@@ -505,6 +510,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   state.capabilities = capabilities
   state.execution_policy = options.execution_policy
     or command.execution_policy or configured.execution_policy or {}
+  local emulator_error = terminal_emulator_load_error
   if terminal_emulator then
     local emulator_ok, emulator = pcall(terminal_emulator.new, {
       columns = options.columns,
@@ -512,6 +518,11 @@ local function start_runtime(service, runtimes, history_directory, command, skip
       scrollback_limit = options.scrollback_limit,
       term = options.term,
     })
+    if not emulator_ok then
+      emulator_error = tostring(emulator)
+    elseif not emulator then
+      emulator_error = "terminal emulator constructor returned no emulator"
+    end
     if emulator_ok and emulator then
       local checkpoint_offset, checkpoint_data = read_checkpoint(checkpoint_path)
       if checkpoint_offset and checkpoint_offset >= oldest_offset
@@ -531,6 +542,7 @@ local function start_runtime(service, runtimes, history_directory, command, skip
       end
     end
   end
+  state.emulator_error = emulator_error
   state.status = "starting"
   runtimes[runtime_id] = state
 
@@ -986,6 +998,8 @@ local function poll_runtimes(service, runtimes)
             if state.emulator then
               local fed, feed_message = pcall(function() return state.emulator:feed(data) end)
               if not fed then checkpointed, checkpoint_message = false, tostring(feed_message) end
+            elseif state.emulator_error then
+              checkpointed, checkpoint_message = false, state.emulator_error
             end
             if checkpointed then
               local checkpoint_changed, checkpoint_result
