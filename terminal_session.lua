@@ -138,7 +138,7 @@ function WorkbenchSession.new(client, resource, options)
         local_process = true,
         persistent = true,
         replay = false,
-        events_applied = true,
+        events_applied = false,
       },
       write = function(_, data)
         return local_session:write(data)
@@ -171,8 +171,12 @@ function WorkbenchSession.new(client, resource, options)
   end
 
   local emulator = options.emulator or terminal.new_emulator {
-    columns = resource.cols or 80, rows = resource.rows or 24,
-    scrollback_limit = options.scrollback_limit or 10000
+    columns = options.columns or resource.cols or 80,
+    rows = options.rows or resource.rows or 24,
+    scrollback_limit = options.scrollback_limit or 10000,
+    term = options.term,
+    environment = options.environment,
+    debug = options.debug,
   }
   local self = setmetatable({
     client = client, resource = resource, resource_id = resource_id,

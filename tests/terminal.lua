@@ -1,5 +1,8 @@
 local test = require "core.test"
 local Client = require "plugins.workbench.client"
+local Runtime = require "plugins.workbench.runtime"
+local WorkbenchSession = require "plugins.workbench.terminal_session"
+local WorkbenchTerminalView = require "plugins.workbench.terminal_view".class
 
 local workspace_sequence = 0
 
@@ -9,6 +12,48 @@ local function new_workspace_id()
 end
 
 test.describe("Workbench terminal integration", function()
+  test.test("defers a new runtime until terminal geometry is known", function()
+    local calls = 0
+    local received
+    local session = {}
+    local client = {
+      backend = "test",
+      workspace_id = new_workspace_id(),
+      terminal_session = function(_, _, options)
+        calls = calls + 1
+        received = options
+        return session
+      end,
+    }
+
+    local view = WorkbenchTerminalView {
+      client = client,
+      terminal_id = "terminal-deferred",
+      terminal_options = { debug = true },
+    }
+    test.equal(calls, 0)
+
+    view.columns, view.lines = 117, 38
+    test.equal(view:create_session(), session)
+    test.equal(calls, 1)
+    test.equal(received.columns, 117)
+    test.equal(received.rows, 38)
+    test.equal(received.debug, true)
+    Runtime.remove(client, "terminal-deferred")
+  end)
+
+  test.test("uses measured geometry for the remote display grid", function()
+    local session = WorkbenchSession({ backend = "agent" }, {
+      id = "terminal-remote", cols = 80, rows = 24,
+    }, {
+      columns = 117, rows = 38,
+    })
+    local columns, rows = session.emulator:size()
+    test.equal(columns, 117)
+    test.equal(rows, 38)
+    session.emulator:close()
+  end)
+
   test.test("owns a local PTY through the Workbench session boundary", function()
     test.skip_if(PLATFORM == "Windows", "POSIX PTY launch is required")
 

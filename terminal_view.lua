@@ -33,7 +33,14 @@ function WorkbenchTerminalView:new(options)
       self.runtime_state.session = nil
     end
   end
-  self.session = session or assert(self.client:terminal_session(self.terminal_id, {
+  self.session = session
+  self.runtime_state.session = self.session
+  self.runtime_state.view = self
+  Runtime.set(self.client, self.terminal_id, self.runtime_state)
+end
+
+function WorkbenchTerminalView:create_session()
+  local session = assert(self.client:terminal_session(self.terminal_id, {
     columns = self.columns,
     rows = self.lines,
     shell = self.options.shell,
@@ -42,12 +49,10 @@ function WorkbenchTerminalView:new(options)
     environment = self.options.environment,
     term = self.options.term,
     scrollback_limit = self.options.scrollback_limit,
+    debug = self.options.debug,
   }))
-  self.emulator = self.session.emulator
-  self.terminal = self.emulator
-  self.runtime_state.session = self.session
-  self.runtime_state.view = self
-  Runtime.set(self.client, self.terminal_id, self.runtime_state)
+  self.runtime_state.session = session
+  return session
 end
 
 function WorkbenchTerminalView:get_name()
