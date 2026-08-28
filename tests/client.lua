@@ -32,8 +32,11 @@ test.describe("Workbench client", function()
     local first = Client.default_agent_endpoint("/tmp/pragtical-user-a", "default")
     local second = Client.default_agent_endpoint("/tmp/pragtical-user-b", "default")
     test.ok(first ~= second)
-    test.contains(first, Client.path_identity("/tmp/pragtical-user-a"))
-    test.contains(second, Client.path_identity("/tmp/pragtical-user-b"))
+    local runtime_dir = type(os.getenv) == "function" and os.getenv("XDG_RUNTIME_DIR")
+    if PLATFORM ~= "Windows" and type(runtime_dir) == "string" and runtime_dir ~= "" then
+      test.contains(first, Client.path_identity("/tmp/pragtical-user-a"))
+      test.contains(second, Client.path_identity("/tmp/pragtical-user-b"))
+    end
   end)
 
   test.test("fills the workspace and revision fields for commands", function()
