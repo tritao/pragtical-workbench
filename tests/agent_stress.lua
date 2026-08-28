@@ -5,6 +5,9 @@ local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "",
   "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
+-- ConPTY routes output through the Windows console host and throttles bulk
+-- synthetic streams. Keep enough output to rotate history while retaining a
+-- larger stress level on the native PTY platforms.
 local stress_output_bytes = PLATFORM == "Windows" and 4 * 1024 or 2 * 1024 * 1024
 local stress_history_bytes = PLATFORM == "Windows" and 1024 or 64 * 1024
 
