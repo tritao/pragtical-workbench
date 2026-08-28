@@ -33,11 +33,8 @@ local function runtime_config()
       shell = "cmd.exe",
       args = {
         "/S", "/C",
-        "powershell.exe -NoProfile -NonInteractive -Command "
-          .. "\"$bytes = [Text.Encoding]::ASCII.GetBytes((('X' * "
-          .. tostring(stress_output_bytes) .. ") -join '')); "
-          .. "[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length); "
-          .. "Start-Sleep -Seconds 4\"",
+        "for /L %G in (1,1," .. tostring(stress_output_bytes)
+          .. ") do @echo X",
       },
       max_history_bytes = stress_history_bytes,
       checkpoint_interval_bytes = 64 * 1024,
