@@ -510,8 +510,12 @@ local function start_runtime(service, runtimes, history_directory, command, skip
   state.capabilities = capabilities
   state.execution_policy = options.execution_policy
     or command.execution_policy or configured.execution_policy or {}
-  local emulator_error = terminal_emulator_load_error
-  if terminal_emulator then
+  -- Some consumers only need durable runtime output and replay. Let them
+  -- opt out of screen rendering so history throughput is independent of the
+  -- terminal emulator's parsing cost.
+  local emulator_enabled = configured.emulator ~= false
+  local emulator_error = emulator_enabled and terminal_emulator_load_error or nil
+  if emulator_enabled and terminal_emulator then
     local emulator_ok, emulator = pcall(terminal_emulator.new, {
       columns = options.columns,
       rows = options.rows,

@@ -5,7 +5,7 @@ local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "",
   "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
-local stress_output_bytes = PLATFORM == "Windows" and 196608 or 2 * 1024 * 1024
+local stress_output_bytes = 2 * 1024 * 1024
 
 local function find_runtime(snapshot, runtime_id)
   for _, runtime in ipairs(snapshot.runtimes or {}) do
@@ -30,7 +30,7 @@ local function runtime_config()
       args = {
         "/S", "/C",
         "powershell.exe -NoProfile -NonInteractive -Command "
-          .. "\"$bytes = [Text.Encoding]::ASCII.GetBytes([string]::new([char]1, "
+          .. "\"$bytes = [Text.Encoding]::ASCII.GetBytes([string]::new([char]88, "
           .. tostring(stress_output_bytes) .. ")); "
           .. "[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length); "
           .. "Start-Sleep -Seconds 4\"",
@@ -38,6 +38,7 @@ local function runtime_config()
       max_history_bytes = 64 * 1024,
       checkpoint_interval_bytes = 64 * 1024,
       scrollback_limit = 256,
+      emulator = false,
     }
   end
   return {
@@ -46,6 +47,7 @@ local function runtime_config()
     max_history_bytes = 64 * 1024,
     checkpoint_interval_bytes = 64 * 1024,
     scrollback_limit = 256,
+    emulator = false,
   }
 end
 
