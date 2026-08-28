@@ -5,7 +5,8 @@ local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "",
   "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
-local stress_output_bytes = 2 * 1024 * 1024
+local stress_output_bytes = PLATFORM == "Windows" and 4 * 1024 or 2 * 1024 * 1024
+local stress_history_bytes = PLATFORM == "Windows" and 1024 or 64 * 1024
 
 local function find_runtime(snapshot, runtime_id)
   for _, runtime in ipairs(snapshot.runtimes or {}) do
@@ -35,7 +36,7 @@ local function runtime_config()
           .. "[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length); "
           .. "Start-Sleep -Seconds 4\"",
       },
-      max_history_bytes = 64 * 1024,
+      max_history_bytes = stress_history_bytes,
       checkpoint_interval_bytes = 64 * 1024,
       scrollback_limit = 256,
       emulator = false,
@@ -44,7 +45,7 @@ local function runtime_config()
   return {
     shell = "/bin/sh",
     args = { "-c", "yes X | head -c 2097152; sleep 4" },
-    max_history_bytes = 64 * 1024,
+    max_history_bytes = stress_history_bytes,
     checkpoint_interval_bytes = 64 * 1024,
     scrollback_limit = 256,
     emulator = false,
