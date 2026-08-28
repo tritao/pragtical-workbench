@@ -20,7 +20,7 @@ agent.lua                # Optional persistent agent server
 tests/                   # Service, protocol, and agent integration tests
 docs/                    # Architecture and implementation plans
 
-src/api/workbench_transport.c
+src/api/local_transport.c
 src/workbench-agent/main.c
 ```
 

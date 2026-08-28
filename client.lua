@@ -1,5 +1,5 @@
 local native_available, native = pcall(require, "workbench")
-local transport_available, transport = pcall(require, "workbench_transport")
+local transport_available, transport = pcall(require, "local_transport")
 local Service = require "plugins.workbench.service"
 local Storage = require "plugins.workbench.service.storage"
 local Protocol = require "plugins.workbench.service.protocol"
@@ -415,7 +415,7 @@ function Client:_flush_outgoing()
   while #self.outgoing > 0 do
     local frame = self.outgoing[1]
     local called, sent, message = pcall(function()
-      return self.connection:send_nonblocking(frame)
+      return self.connection:send(frame)
     end)
     if not called then return nil, sent end
     if sent then
@@ -546,7 +546,8 @@ end
 function Client:_wait_request(request)
   while not request.done do
     local _, message = self:poll()
-    if not request.done and message and message ~= "timeout" then
+    if not request.done and message and message ~= "timeout"
+        and message ~= "would_block" then
       self:cancel(request)
       return nil, agent_error("agent_disconnected", message)
     end
@@ -1025,7 +1026,7 @@ function Client:poll()
         return count, frame
       end
       if not frame then
-        if message ~= "timeout" then
+        if message ~= "timeout" and message ~= "would_block" then
           self:_disconnect(message or "Workbench agent disconnected")
         end
         self:_expire_requests(system.get_time())
@@ -1291,7 +1292,7 @@ function Client:close()
     -- tearing down the client.
     if not self.write_pending and #self.outgoing == 0 then
       pcall(function()
-        self.connection:send_nonblocking(Protocol.encode(Protocol.request("close", nil, {})))
+        self.connection:send(Protocol.encode(Protocol.request("close", nil, {})))
       end)
     end
     self.connection:close()
