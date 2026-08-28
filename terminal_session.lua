@@ -178,6 +178,28 @@ function WorkbenchSession.new(client, resource, options)
     client = client, resource = resource, resource_id = resource_id,
     emulator = emulator, status_name = resource.status or "starting"
   }, WorkbenchSession)
+
+  local function request_replay(session, offset)
+    -- A bounded history can legitimately lose the requested prefix between
+    -- detaching and reattaching. Retry from the advertised boundary; the
+    -- agent may include a checkpoint there, followed by the retained bytes.
+    if client.connection and type(client.request_runtime_output_async) == "function" then
+      return client:request_runtime_output_async(resource_id, offset, function(result,
+          error_result)
+        if error_result or type(result) ~= "table"
+            or result.code ~= "runtime_history_gap" then
+          return
+        end
+        local oldest_offset = result.oldest_offset
+        if type(oldest_offset) == "number" and oldest_offset > offset
+            and session:replay_pending() == offset then
+          session:request_replay(oldest_offset)
+        end
+      end)
+    end
+    return call_runtime(client, "request_runtime_output", resource_id, offset)
+  end
+
   self.session = terminal.Session {
     id = resource_id, status = self.status_name, emulator = emulator,
     capabilities = { persistent = true, replay = true, remote = true },
@@ -192,9 +214,7 @@ function WorkbenchSession.new(client, resource, options)
       self.session:set_status("closed")
       return result
     end,
-    request_replay = function(_, offset)
-      return call_runtime(client, "request_runtime_output", resource_id, offset)
-    end,
+    request_replay = request_replay,
     detach = function() return call_runtime(client, "detach_runtime", resource_id) end,
     close = function() return self.session:terminate() end,
     poll_events = function() return self:poll_events() end

@@ -131,9 +131,6 @@ test.describe("Workbench agent terminal runtime", function()
     })
     local reattached = assert(second:terminal_session("checkpoint-terminal"))
     test.ok(reattached:attach())
-    local replay_ok, replay_result = second:request_runtime_output(
-      "checkpoint-terminal", 0)
-    test.ok(replay_ok)
     local checkpoint
     local deadline = system.get_time() + 2
     while not checkpoint and system.get_time() < deadline do
@@ -146,9 +143,7 @@ test.describe("Workbench agent terminal runtime", function()
       if not checkpoint then system.sleep(0.01) end
     end
     test.not_nil(checkpoint, "checkpoint missing (offset "
-      .. tostring(replay_result and replay_result.checkpoint_offset or "unknown")
-      .. ", runtime events "
-      .. tostring(replay_result and #(replay_result.runtime_events or {}) or "unknown")
+      .. tostring(reattached:offset())
       .. (checkpoint_error and ", error: " .. tostring(checkpoint_error) or "")
       .. ")")
     test.ok(reattached:apply_checkpoint(checkpoint, reattached.emulator))
