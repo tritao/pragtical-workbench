@@ -4,7 +4,7 @@ local Protocol = require "plugins.workbench.service.protocol"
 local MessagePack = require "plugins.workbench.service.msgpack"
 local Service = require "plugins.workbench.service"
 local Storage = require "plugins.workbench.service.storage"
-local transport = require "workbench_transport"
+local transport = require "local_transport"
 local runtime_native = require "workbench_runtime"
 
 local terminal_emulator
@@ -1323,7 +1323,7 @@ local function process_client(service, client, options, runtimes, history_direct
     end)
     if not received then return nil, frame end
     if not frame then
-      if receive_message == "timeout" then return true end
+      if receive_message == "timeout" or receive_message == "would_block" then return true end
       return nil, receive_message or "Workbench client disconnected"
     end
 
@@ -1370,7 +1370,7 @@ local function flush_client(client, runtime_events)
   while #client.outgoing > 0 do
     local frame = client.outgoing[1]
     local called, sent, send_message = pcall(function()
-      return client.connection:send_nonblocking(frame)
+      return client.connection:send(frame)
     end)
     if not called then return nil, sent end
     if sent then
@@ -1497,10 +1497,11 @@ function Agent.run(options)
 
   while true do
     if not (options.once and served) then
-      local connection, accept_message = server:accept(options.once and -1 or 10)
+      local connection, accept_message = server:accept(options.once and 1000 or 10)
       if connection then
         add_client(connection)
-      elseif accept_message == "timeout" or accept_message == "unauthorized" then
+      elseif accept_message == "timeout" or accept_message == "would_block"
+          or accept_message == "unauthorized" then
         -- The shared event loop continues servicing existing clients below.
       else
         server:close()
@@ -1514,7 +1515,8 @@ function Agent.run(options)
         local extra, extra_message = server:accept(0)
         if extra then
           add_client(extra)
-        elseif extra_message == "timeout" or extra_message == "unauthorized" then
+        elseif extra_message == "timeout" or extra_message == "would_block"
+            or extra_message == "unauthorized" then
           break
         else
           server:close()
