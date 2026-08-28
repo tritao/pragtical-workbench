@@ -92,19 +92,11 @@ SidebarHost:register("workbench", function(state)
     return legacy
   end
   return Sidebar.from_state(state)
-end, { restore = config.plugins.workbench.startup ~= "never" })
-
-local function add_toolbar_button()
-  local treeview = package.loaded["plugins.treeview"]
-  local toolbar = treeview and treeview.toolbar
-  if not toolbar then return end
-  for _, item in ipairs(toolbar.toolbar_commands or {}) do
-    if item.command == "workbench:open" then return end
-  end
-  table.insert(toolbar.toolbar_commands, { symbol = "W", command = "workbench:open" })
-end
-
-add_toolbar_button()
+end, {
+  label = "Workbench",
+  order = 20,
+  restore = config.plugins.workbench.startup ~= "never",
+})
 
 local startup = config.plugins.workbench.startup
 if Sidebar.should_open_on_startup(startup, SidebarHost:has_saved_state()) then

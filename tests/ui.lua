@@ -22,7 +22,10 @@ test.describe("Workbench sidebar", function()
       backend = "fake",
       workspace_id = new_workspace_id(),
     }
-    SidebarHost:register("workbench", sidebar)
+    SidebarHost:register("workbench", sidebar, {
+      label = "Workbench",
+      order = 20,
+    })
   end)
 
   test.after_each(function()
@@ -140,7 +143,8 @@ test.describe("Workbench sidebar", function()
     test.ok(view.size.x > 0)
 
     local attached = core.root_view.root_node:get_node_for_view(view)
-    test.not_nil(attached)
+    test.is_nil(attached)
+    test.equal(core.root_view.root_node:get_node_for_view(SidebarHost.shell), SidebarHost.node)
   end)
 
   test.test("clears the singleton when the sidebar is closed", function()
@@ -152,17 +156,67 @@ test.describe("Workbench sidebar", function()
 
   test.test("switches Files and Workbench in one sidebar slot", function()
     SidebarHost:show("workbench")
-    local slot = core.root_view.root_node:get_node_for_view(sidebar)
+    local slot = SidebarHost.node
     test.not_nil(slot)
     test.ok(SidebarHost:is_active("workbench"))
 
     SidebarHost:show("files")
     test.ok(SidebarHost:is_active("files"))
     test.equal(core.root_view.root_node:get_node_for_view(sidebar), nil)
-    test.equal(core.root_view.root_node:get_node_for_view(SidebarHost:get_view("files")), slot)
+    test.equal(core.root_view.root_node:get_node_for_view(SidebarHost.shell), slot)
 
     SidebarHost:show("workbench")
-    test.equal(core.root_view.root_node:get_node_for_view(sidebar), slot)
+    test.equal(core.root_view.root_node:get_node_for_view(sidebar), nil)
+    test.equal(core.root_view.root_node:get_node_for_view(SidebarHost.shell), slot)
+  end)
+
+  test.test("keeps the shared switcher above both panels", function()
+    local modes = SidebarHost:get_modes()
+    test.equal(modes[1].mode, "files")
+    test.equal(modes[1].label, "Files")
+    test.equal(modes[2].mode, "workbench")
+    test.equal(modes[2].label, "Workbench")
+
+    SidebarHost:show("workbench")
+    core.root_view:update()
+    local shell = SidebarHost.shell
+    test.equal(core.root_view.root_node:get_node_for_view(shell), SidebarHost.node)
+    test.equal(sidebar.position.y, shell.position.y + shell:get_tab_height())
+    test.equal(sidebar.size.y, shell.size.y - shell:get_tab_height())
+
+    SidebarHost:show("files")
+    core.root_view:update()
+    local files = SidebarHost:get_view("files")
+    test.equal(files.position.y, shell.position.y + shell:get_tab_height())
+    test.equal(core.root_view.root_node:get_node_for_view(shell), SidebarHost.node)
+  end)
+
+  test.test("preserves panel state while switching and hiding the shell", function()
+    SidebarHost:show("workbench")
+    sidebar.selected_id = "selected-item"
+    sidebar.scroll.to.y = 37
+    local saved_width = SidebarHost:get_entry("workbench").width
+
+    SidebarHost:show("files")
+    SidebarHost:show("workbench")
+    test.equal(sidebar.selected_id, "selected-item")
+    test.equal(sidebar.scroll.to.y, 37)
+    test.equal(SidebarHost:get_entry("workbench").width, saved_width)
+
+    SidebarHost:toggle("workbench")
+    test.ok(not SidebarHost.visible)
+    test.equal(SidebarHost.active_mode, "workbench")
+    SidebarHost:toggle("workbench")
+    test.ok(SidebarHost.visible)
+    test.equal(core.active_view, sidebar)
+  end)
+
+  test.test("falls back to Files when an active mode is unregistered", function()
+    SidebarHost:show("workbench")
+    test.ok(SidebarHost:unregister("workbench"))
+    test.equal(SidebarHost.active_mode, "files")
+    test.ok(SidebarHost:is_active("files"))
+    test.equal(core.root_view.root_node:get_node_for_view(SidebarHost.shell), SidebarHost.node)
   end)
 
   test.test("adopts a legacy standalone Workbench sidebar", function()
@@ -177,7 +231,8 @@ test.describe("Workbench sidebar", function()
     SidebarHost:register("workbench", legacy)
     SidebarHost:show("workbench")
 
-    test.equal(core.root_view.root_node:get_node_for_view(legacy), SidebarHost.node)
+    test.equal(core.root_view.root_node:get_node_for_view(legacy), nil)
+    test.equal(core.root_view.root_node:get_node_for_view(SidebarHost.shell), SidebarHost.node)
     test.ok(SidebarHost:is_active("workbench"))
   end)
 end)

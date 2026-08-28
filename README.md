@@ -113,11 +113,13 @@ clients migrate to `execution_policy`.
 
 ## Sidebar behavior
 
-Workbench shares Pragtical's single left sidebar slot with Files. By default,
-the first launch opens Workbench and later launches restore the last selected
-mode and visibility. Use `workbench:open` to switch to Workbench,
-`workbench:show-files` to switch back to Files, and `workbench:toggle` to hide
-or restore the shared sidebar.
+Workbench shares Pragtical's single left sidebar shell with Files. The shell
+shows a compact Files/Workbench tab strip above the active panel; switching
+tabs keeps both panels alive, including their independent selection, scroll,
+workspace, and width state. By default, the first launch opens Workbench and
+later launches restore the last selected mode and visibility. Use
+`workbench:open` to select Workbench, `workbench:show-files` to select Files,
+and `workbench:toggle` to hide or restore the shared sidebar.
 
 The startup policy can be configured as `restore`, `always`, or `never` with
 `config.plugins.workbench.startup`.

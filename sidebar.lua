@@ -1,6 +1,5 @@
 local core = require "core"
 local command = require "core.command"
-local common = require "core.common"
 local config = require "core.config"
 local SidebarHost = require "core.sidebar"
 local style = require "core.style"
@@ -57,7 +56,6 @@ function Sidebar:new(options)
   self.type_name = "plugins.workbench.sidebar"
   self.scrollable = true
   self.visible = true
-  self.init_size = true
   self.target_size = options.size or config.plugins.workbench.size
   self.selected_id = options.selected_id
   self.hovered_index = nil
@@ -342,16 +340,12 @@ function Sidebar:activate_empty_action(index)
   return command.perform(action.command)
 end
 
-function Sidebar:get_mode_bar_height()
-  return style.font:get_height() + style.padding.y
-end
-
 function Sidebar:get_scrollable_size()
   local content_height = #self.model.rows * self:get_item_height()
   if self:is_empty() then
     content_height = self:get_item_height() * (#empty_actions + 1)
   end
-  return self:get_mode_bar_height() + style.padding.y + content_height
+  return style.padding.y + content_height
 end
 
 function Sidebar:row_at(x, y)
@@ -360,10 +354,8 @@ function Sidebar:row_at(x, y)
     or x > self.position.x + self.size.x then
     return nil
   end
-  local bar_height = self:get_mode_bar_height()
-  if y < self.position.y + bar_height then return nil end
   local h = self:get_item_height()
-  local index = math.floor((y - self.position.y - bar_height + self.scroll.y) / h) + 1
+  local index = math.floor((y - self.position.y + self.scroll.y) / h) + 1
   if index < 1 or index > #self.model.rows then return nil end
   return index, self.model:get_row(index)
 end
@@ -374,8 +366,7 @@ function Sidebar:empty_action_at(x, y)
     or x > self.position.x + self.size.x then
     return nil
   end
-  local start_y = self.position.y + self:get_mode_bar_height()
-    + style.padding.y + self:get_item_height()
+  local start_y = self.position.y + style.padding.y + self:get_item_height()
   local index = math.floor((y - start_y) / self:get_item_height()) + 1
   if index < 1 or index > #empty_actions then return nil end
   return index
@@ -412,16 +403,6 @@ end
 function Sidebar:on_mouse_pressed(button, x, y, clicks)
   local processed = Sidebar.super.on_mouse_pressed(self, button, x, y, clicks)
   if processed or button ~= "left" then return processed end
-  local bar_height = self:get_mode_bar_height()
-  if y >= self.position.y and y < self.position.y + bar_height then
-    local files_width = style.font:get_width("Files") + style.padding.x * 2
-    if x < self.position.x + files_width then
-      SidebarHost:show("files")
-    else
-      SidebarHost:show("workbench")
-    end
-    return true
-  end
   local empty_index = self:empty_action_at(x, y)
   if empty_index then
     self:activate_empty_action(empty_index)
@@ -441,17 +422,6 @@ end
 
 function Sidebar:update()
   local processed = Sidebar.super.update(self)
-
-  local dest = self.visible and common.round(self.target_size) or 0
-  if self.init_size then
-    self.size.x = dest
-    self.init_size = false
-  elseif self.size.x ~= dest then
-    self:move_towards(self.size, "x", dest, nil, "workbench")
-    -- Round to keep the neighbouring pane pixel-aligned while resizing.
-    self.size.x = common.round(self.size.x)
-    if math.abs(dest - self.size.x) < 2 then self.size.x = dest end
-  end
 
   if self.client then
     local ok, result = pcall(function() return self.client:poll() end)
@@ -487,28 +457,7 @@ end
 
 function Sidebar:draw()
   self:draw_background(style.background2)
-  local bar_height = self:get_mode_bar_height()
-  local bar_y = self.position.y
-  renderer.draw_rect(self.position.x, bar_y, self.size.x, bar_height, style.background)
-  local files_color = SidebarHost:is_active("files") and style.text or style.dim
-  local workbench_color = SidebarHost:is_active("workbench") and style.text or style.dim
-  local files_x = self.position.x + style.padding.x
-  local files_width = style.font:get_width("Files") + style.padding.x * 2
-  if SidebarHost:is_active("files") then
-    renderer.draw_rect(self.position.x, bar_y, files_width, bar_height, style.line_highlight)
-  end
-  renderer.draw_text(style.font, "Files", files_x,
-    bar_y + style.padding.y / 2, files_color)
-  local workbench_x = files_x + files_width
-  local workbench_width = style.font:get_width("Workbench") + style.padding.x * 2
-  if SidebarHost:is_active("workbench") then
-    renderer.draw_rect(self.position.x + files_width, bar_y,
-      workbench_width, bar_height, style.line_highlight)
-  end
-  renderer.draw_text(style.font, "Workbench", workbench_x,
-    bar_y + style.padding.y / 2, workbench_color)
   local x, y = self:get_content_offset()
-  y = y + bar_height
   local h = self:get_item_height()
   if self:is_empty() then
     local header_y = y + style.padding.y
@@ -526,7 +475,7 @@ function Sidebar:draw()
     end
   end
   if not self:is_empty() then
-    local top = self.position.y + bar_height
+    local top = self.position.y
     local bottom = top + self.size.y
     for index, row in ipairs(self.model.rows) do
       local row_y = y + (index - 1) * h + style.padding.y / 2
