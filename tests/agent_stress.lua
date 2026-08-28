@@ -5,6 +5,8 @@ local endpoint = os.getenv("WORKBENCH_AGENT_ENDPOINT")
 assert(endpoint and endpoint ~= "",
   "set WORKBENCH_AGENT_ENDPOINT or run scripts/test-workbench.sh")
 
+local stress_output_bytes = PLATFORM == "Windows" and 196608 or 2 * 1024 * 1024
+
 local function find_runtime(snapshot, runtime_id)
   for _, runtime in ipairs(snapshot.runtimes or {}) do
     if runtime.id == runtime_id then return runtime end
@@ -28,7 +30,9 @@ local function runtime_config()
       args = {
         "/S", "/C",
         "powershell.exe -NoProfile -NonInteractive -Command "
-          .. "\"$bytes = [Text.Encoding]::ASCII.GetBytes(('X' * 2097152)); "
+          .. "\"$bytes = [byte[]]::new(" .. tostring(stress_output_bytes) .. "); "
+          .. "for ($i = 0; $i -lt $bytes.Length; $i += 3) { "
+          .. "$bytes[$i] = 88; $bytes[$i + 1] = 13; $bytes[$i + 2] = 10 }; "
           .. "[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length); "
           .. "Start-Sleep -Seconds 4\"",
       },
@@ -168,8 +172,8 @@ test.describe("Workbench agent stress behavior", function()
     local started, start_result = first:start_runtime(runtime_id)
     test.ok(started, start_result and start_result.message)
 
-    local total, last_offset = collect_output(first, runtime_id, 2 * 1024 * 1024)
-    test.ok(total >= 2 * 1024 * 1024)
+    local total, last_offset = collect_output(first, runtime_id, stress_output_bytes)
+    test.ok(total >= stress_output_bytes)
     test.ok(last_offset >= total)
 
     -- Reattach while the process is still alive, then let it finish before
