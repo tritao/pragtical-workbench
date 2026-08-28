@@ -1004,6 +1004,23 @@ local function poll_runtimes(service, runtimes)
             if state.emulator then
               local fed, feed_message = pcall(function() return state.emulator:feed(data) end)
               if not fed then checkpointed, checkpoint_message = false, tostring(feed_message) end
+              if fed then
+                local replied, reply_or_message = pcall(function()
+                  return state.emulator:take_input()
+                end)
+                if not replied then
+                  checkpointed, checkpoint_message = false, tostring(reply_or_message)
+                elseif #reply_or_message > 0 then
+                  local sent, send_message = service.providers:send_input(
+                    resource, state.runtime, reply_or_message,
+                    provider_context(service, nil, runtime_id))
+                  if not sent then
+                    local _, detail = provider_error_message(send_message,
+                      "terminal reply write failed")
+                    checkpointed, checkpoint_message = false, detail
+                  end
+                end
+              end
             elseif state.emulator_error then
               checkpointed, checkpoint_message = false, state.emulator_error
             end

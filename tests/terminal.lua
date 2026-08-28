@@ -12,6 +12,28 @@ local function new_workspace_id()
 end
 
 test.describe("Workbench terminal integration", function()
+  test.test("decodes native ANSI colors and bold attributes", function()
+    local client = {
+      backend = "test",
+      workspace_id = new_workspace_id(),
+      terminal_session = function() return {} end,
+    }
+    local view = WorkbenchTerminalView {
+      client = client,
+      terminal_id = "terminal-styles",
+    }
+
+    local indexed, attributes = view:convert_color(10 + 1 * 256,
+      "foreground", true)
+    test.same(indexed, view.options.colors[9])
+    test.equal(attributes, 10)
+
+    local rgb = 3 + 0x12 * 256 + 0x34 * 65536 + 0x56 * 16777216
+    local color = view:convert_color(rgb, "foreground", false)
+    test.same(color, { 0x12, 0x34, 0x56, 255 })
+    Runtime.remove(client, "terminal-styles")
+  end)
+
   test.test("defers a new runtime until terminal geometry is known", function()
     local calls = 0
     local received

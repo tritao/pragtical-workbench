@@ -112,6 +112,30 @@ test.describe("Workbench client", function()
     test.is_nil(error_result)
   end)
 
+  test.test("turns an agent disconnect into a terminal error event", function()
+    local remote = setmetatable({
+      backend = "agent",
+      connection = {
+        receive = function() return nil, "connection closed" end,
+        close = function() end,
+      },
+      agent_runtime_events = {},
+      outgoing = {},
+      outgoing_bytes = 0,
+      write_pending = false,
+      requests = {},
+      pending_requests = {},
+      completions = {},
+    }, Client)
+
+    local events = remote:poll_runtime_events("terminal-disconnected")
+    test.equal(#events, 1)
+    test.equal(events[1].type, "status")
+    test.equal(events[1].status, "error")
+    test.contains(events[1].message, "connection closed")
+    test.is_nil(remote.connection)
+  end)
+
   test.test("cancels a request before its completion is delivered", function()
     local callback_called = false
     local request = assert(client:execute_async({

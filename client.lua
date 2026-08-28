@@ -114,7 +114,10 @@ local function start_agent(options, endpoint, data_dir, storage_path, workspace_
     detach = true,
     stdin = process.REDIRECT_DISCARD,
     stdout = process.REDIRECT_DISCARD,
-    stderr = process.REDIRECT_DISCARD,
+    -- Keep startup diagnostics available until the client has connected. An
+    -- agent that exits before binding its endpoint must not look like a
+    -- terminal that is perpetually loading.
+    stderr = process.REDIRECT_PIPE,
   })
   if not ok then return nil, process_handle end
   if not process_handle then
@@ -139,6 +142,22 @@ local function connect_or_start_agent(options, endpoint, data_dir, storage_path,
     system.sleep(0.02)
     connection, message = connect_endpoint(endpoint)
     if connection then return connection end
+    local current = agent_processes[endpoint]
+    if current then
+      local running_ok, running = pcall(function() return current:running() end)
+      if running_ok and not running then
+        local diagnostics = ""
+        if current.stderr then
+          local read_ok, output = pcall(function() return current.stderr:read("all") end)
+          if read_ok and type(output) == "string" then
+            diagnostics = output:gsub("%s+$", "")
+          end
+        end
+        agent_processes[endpoint] = nil
+        return nil, diagnostics ~= "" and diagnostics
+          or "Workbench agent exited during startup"
+      end
+    end
   until system.get_time() >= deadline
   return nil, message or "Timed out waiting for Workbench agent"
 end
@@ -1202,9 +1221,18 @@ function Client:poll_runtime_events(runtime_id)
     return self.handle:poll_runtime_events(runtime_id)
   end
   if self.connection then
-    self:poll()
+    local _, message = self:poll()
     local events = self.agent_runtime_events[runtime_id] or {}
     self.agent_runtime_events[runtime_id] = {}
+    if not self.connection then
+      events[#events + 1] = {
+        type = "status",
+        runtime_id = runtime_id,
+        status = "error",
+        message = type(message) == "table" and message.message
+          or tostring(message or "Workbench agent disconnected"),
+      }
+    end
     return events
   end
   return {}
