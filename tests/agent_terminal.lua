@@ -153,4 +153,55 @@ test.describe("Workbench agent terminal runtime", function()
     reattached:terminate()
     second:close()
   end)
+
+  test.test("preserves a live screen and rejects mutations after storage loss", function()
+    test.skip_if(PLATFORM == "Windows", "open SQLite files cannot be removed")
+    local client = assert(Client.open {
+      backend = "agent", endpoint = endpoint,
+      workspace_id = "agent-terminal-test",
+    })
+    local created = client:execute {
+      type = "terminal.create", id = "volatile-terminal",
+      title = "Volatile shell", cols = 80, rows = 24,
+      status = "starting", config = {
+        shell = "/bin/sh", args = { "-c", "printf volatile-screen; sleep 10" },
+      },
+    }
+    test.equal(created.code, "ok")
+    local session = assert(client:terminal_session("volatile-terminal"))
+    test.ok(session:attach())
+    test.contains(collect_output(session, 2, "volatile-screen"), "volatile-screen")
+
+    local state_dir = endpoint:match("^(.+)/[^/]+$")
+    local removed, remove_message = os.remove(state_dir .. "/workbench.sqlite3")
+    test.ok(removed, remove_message)
+
+    local storage_error
+    local deadline = system.get_time() + 2
+    while not storage_error and system.get_time() < deadline do
+      for _, event in ipairs(session:poll_events()) do
+        if event.type == "status" and event.status == "error"
+            and tostring(event.message):find("storage", 1, true) then
+          storage_error = event.message
+        end
+      end
+      if not storage_error then system.sleep(0.01) end
+    end
+    test.not_nil(storage_error)
+
+    local replay_ok, replay = client:request_runtime_output("volatile-terminal", 0)
+    test.ok(replay_ok)
+    local live_checkpoint
+    for _, event in ipairs(replay.runtime_events or {}) do
+      if event.type == "checkpoint" and event.live then live_checkpoint = event end
+    end
+    test.not_nil(live_checkpoint)
+
+    local rejected = client:execute {
+      type = "runtime.resize", runtime_id = "volatile-terminal",
+      columns = 100, rows = 30,
+    }
+    test.equal(rejected.code, "storage_unavailable")
+    client:close()
+  end)
 end)

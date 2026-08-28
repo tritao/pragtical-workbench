@@ -41,6 +41,23 @@ local function safe_path_component(value)
   return component ~= "" and component or "default"
 end
 
+local function path_identity(value)
+  local normalized = tostring(value or "default")
+  if system and system.absolute_path then
+    local ok, absolute = pcall(system.absolute_path, normalized)
+    if ok and absolute then normalized = absolute end
+  end
+  normalized = normalized:gsub("\\", "/")
+  if PLATFORM == "Windows" then normalized = normalized:lower() end
+  local first, second = 5381, 52711
+  for index = 1, #normalized do
+    local byte = normalized:byte(index)
+    first = (first * 33 + byte) % 4294967296
+    second = (second * 65599 + byte) % 4294967296
+  end
+  return string.format("%08x%08x", first, second)
+end
+
 local function path_directory(path, fallback)
   return path and path:match("^(.+)[/\\][^/\\]+$") or fallback
 end
@@ -51,15 +68,16 @@ local function default_storage_path(workspace_id)
     .. safe_path_component(workspace_id) .. PATHSEP .. "workbench.sqlite3"
 end
 
-local function default_agent_endpoint(data_dir, workspace_id)
+local function default_agent_endpoint(user_dir, workspace_id)
   if PLATFORM ~= "Windows" and type(os) == "table" and type(os.getenv) == "function" then
     local runtime_dir = os.getenv("XDG_RUNTIME_DIR")
     if type(runtime_dir) == "string" and runtime_dir ~= "" then
       return runtime_dir .. PATHSEP .. "pragtical" .. PATHSEP .. "workbench"
-        .. PATHSEP .. safe_path_component(workspace_id) .. ".sock"
+        .. PATHSEP .. path_identity(user_dir) .. PATHSEP
+        .. safe_path_component(workspace_id) .. ".sock"
     end
   end
-  return data_dir .. PATHSEP .. "workbench.sock"
+  return user_dir .. PATHSEP .. "workbench.sock"
 end
 
 local function file_exists(path)
@@ -696,12 +714,14 @@ function Client.open(options)
     if not transport_available then
       return nil, "Workbench agent transport is disabled"
     end
+    local verify_storage = options.storage_path ~= nil or options.endpoint == nil
     local storage_path = options.storage_path or default_storage_path(workspace_id)
     if type(storage_path) ~= "string" or storage_path == "" then
       return nil, "Workbench agent storage path is unavailable"
     end
     local data_dir = options.data_dir or path_directory(storage_path, USERDIR or ".")
-    local endpoint = options.endpoint or default_agent_endpoint(data_dir, workspace_id)
+    local endpoint = options.endpoint or default_agent_endpoint(
+      options.user_dir or USERDIR or data_dir, workspace_id)
     local connection, connect_message = connect_or_start_agent(options, endpoint,
       data_dir, storage_path, workspace_id)
     if not connection then
@@ -725,13 +745,15 @@ function Client.open(options)
       outgoing_bytes = 0,
       write_pending = false,
     }, Client)
-    local hello, message = client:_agent_message(Protocol.request("hello",
-      next_id("workbench-hello"), {
+    local hello_options = {
         workspace_id = workspace_id,
         protocol_major = Protocol.major,
         protocol_minor = Protocol.minor,
         capabilities = { event_replay = true, event_cursors = true },
-      }), "hello_result")
+      }
+    if verify_storage then hello_options.storage_path = storage_path end
+    local hello, message = client:_agent_message(Protocol.request("hello",
+      next_id("workbench-hello"), hello_options), "hello_result")
     if not hello then
       connection:close()
       return nil, message and message.message or "Workbench agent handshake failed"
@@ -1292,5 +1314,8 @@ function Client:close()
   end
   self.closed = true
 end
+
+Client.default_agent_endpoint = default_agent_endpoint
+Client.path_identity = path_identity
 
 return Client

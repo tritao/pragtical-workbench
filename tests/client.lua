@@ -28,6 +28,14 @@ test.describe("Workbench client", function()
     test.equal(client:snapshot().revision, 0)
   end)
 
+  test.test("namespaces agent endpoints by user directory", function()
+    local first = Client.default_agent_endpoint("/tmp/pragtical-user-a", "default")
+    local second = Client.default_agent_endpoint("/tmp/pragtical-user-b", "default")
+    test.ok(first ~= second)
+    test.contains(first, Client.path_identity("/tmp/pragtical-user-a"))
+    test.contains(second, Client.path_identity("/tmp/pragtical-user-b"))
+  end)
+
   test.test("fills the workspace and revision fields for commands", function()
     local events = {}
     client:on_event(function(event)

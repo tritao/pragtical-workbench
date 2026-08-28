@@ -815,11 +815,30 @@ local function replay_runtime(service, runtimes, command)
   end
   local replay_offset = offset
   local events = {}
+  -- A running runtime has a more authoritative screen than its persisted
+  -- history. Send that live emulator state on every attachment so a missing
+  -- or empty history file cannot produce a blank terminal.
+  local live_checkpoint
+  if state and state.emulator then
+    local captured, checkpoint_data = pcall(function()
+      return state.emulator:checkpoint()
+    end)
+    if captured and type(checkpoint_data) == "string" then
+      live_checkpoint = {
+        type = "checkpoint", runtime_id = command.runtime_id,
+        offset = newest_offset, data = checkpoint_data,
+        oldest_offset = oldest_offset, newest_offset = newest_offset,
+        live = true,
+      }
+    end
+  end
   local checkpoint_path = state and state.checkpoint_path
     or persisted and persisted.checkpoint_path
   local checkpoint_offset, checkpoint_data
-  if checkpoint_path then checkpoint_offset, checkpoint_data = read_checkpoint(checkpoint_path) end
-  if checkpoint_offset and checkpoint_data and offset < checkpoint_offset
+  if not live_checkpoint and checkpoint_path then
+    checkpoint_offset, checkpoint_data = read_checkpoint(checkpoint_path)
+  end
+  if not live_checkpoint and checkpoint_offset and checkpoint_data and offset < checkpoint_offset
       and checkpoint_offset >= oldest_offset and checkpoint_offset <= newest_offset then
     events[#events + 1] = {
       type = "checkpoint", runtime_id = command.runtime_id,
@@ -829,13 +848,17 @@ local function replay_runtime(service, runtimes, command)
     replay_offset = checkpoint_offset
   end
   local data, replay_error = replay_history(path, replay_offset, oldest_offset, newest_offset)
-  if not data then return replay_error end
-  if #data > 0 then
+  if not data and not live_checkpoint then return replay_error end
+  if data and #data > 0 then
     events[#events + 1] = {
       type = "output", runtime_id = command.runtime_id,
       offset = replay_offset, data = data,
       oldest_offset = oldest_offset, newest_offset = newest_offset,
     }
+  end
+  if live_checkpoint then
+    events[#events + 1] = live_checkpoint
+    checkpoint_offset = newest_offset
   end
   return { code = "ok", runtime_id = command.runtime_id,
     offset = offset, available = newest_offset, oldest_offset = oldest_offset,
@@ -1063,6 +1086,48 @@ local function poll_runtimes(service, runtimes)
   end
 end
 
+local function poll_degraded_runtimes(service, runtimes, storage_error)
+  for runtime_id, state in pairs(runtimes) do
+    if state.runtime then
+      local resource = service.resources[state.resource_id]
+      local status = service.providers:refresh_status(resource, state.runtime,
+        provider_context(service, nil, runtime_id))
+      if status then
+        local data = status.output
+        if type(data) == "string" and #data > 0 then
+          if state.emulator then
+            pcall(function()
+              state.emulator:feed(data)
+              local reply = state.emulator:take_input()
+              if #reply > 0 then
+                service.providers:send_input(resource, state.runtime, reply,
+                  provider_context(service, nil, runtime_id))
+              end
+            end)
+          end
+          local offset = state.newest_offset
+          state.newest_offset = offset + #data
+          state.offset = state.newest_offset
+          state.output_bytes = (state.output_bytes or offset) + #data
+          queue_runtime_event(state, {
+            type = "output", runtime_id = runtime_id, offset = offset, data = data,
+            oldest_offset = state.oldest_offset,
+            newest_offset = state.newest_offset, volatile = true,
+          })
+        end
+        if status.status == "exited" then
+          state.runtime = nil
+          state.status = "interrupted"
+          queue_runtime_event(state, {
+            type = "status", runtime_id = runtime_id, status = "error",
+            message = storage_error, offset = state.newest_offset,
+          })
+        end
+      end
+    end
+  end
+end
+
 local MAX_MESSAGES_PER_CLIENT = 64
 local MAX_OUTBOUND_MESSAGES = 1024
 local MAX_OUTBOUND_BYTES = 8 * 1024 * 1024
@@ -1131,6 +1196,10 @@ local function handle_client_message(service, client, options, runtimes, history
       return enqueue(client, error_message(message.request_id, "workspace_mismatch",
         "requested workspace does not match the agent workspace"))
     end
+    if message.storage_path and message.storage_path ~= options.storage_path then
+      return enqueue(client, error_message(message.request_id, "storage_mismatch",
+        "requested storage does not match the agent storage"))
+    end
     return enqueue(client, Protocol.request("hello_result", message.request_id, {
       ok = true,
       workspace_id = workspace_id,
@@ -1189,6 +1258,11 @@ local function handle_client_message(service, client, options, runtimes, history
       event_cursor = service.event_sequence,
     }))
   elseif message.kind == "batch" then
+    if options.storage_error then
+      return enqueue(client, Protocol.request("result", message.request_id, {
+        result = { code = "storage_unavailable", message = options.storage_error },
+      }))
+    end
     if type(message.commands) ~= "table" then
       return enqueue(client, error_message(message.request_id, "invalid_command",
         "commands are required"))
@@ -1207,6 +1281,11 @@ local function handle_client_message(service, client, options, runtimes, history
     if not valid then
       return enqueue(client, error_message(message.request_id, "invalid_command",
         validation_message))
+    end
+    if options.storage_error and command.type ~= "runtime.replay" then
+      return enqueue(client, Protocol.request("result", message.request_id, {
+        result = { code = "storage_unavailable", message = options.storage_error },
+      }))
     end
     local result
     if command.type == "runtime.start" then
@@ -1368,6 +1447,7 @@ function Agent.run(options)
     event_limit = options.event_limit,
   })
   assert(store, message)
+  local storage_identity = system.get_file_info(options.storage_path)
   local service = Service.new {
     workspace_id = options.workspace_id or "default",
     store = store,
@@ -1385,6 +1465,25 @@ function Agent.run(options)
 
   local served = false
   local clients = {}
+
+  local function check_storage()
+    if options.storage_error then return false end
+    local current = system.get_file_info(options.storage_path)
+    local same = current and storage_identity
+      and (not storage_identity.device or current.device == storage_identity.device)
+      and (not storage_identity.inode or current.inode == storage_identity.inode)
+      and (not current.links or current.links > 0)
+    if same then return true end
+    options.storage_error = "Workbench storage was removed or replaced; "
+      .. "live runtimes are preserved in volatile mode"
+    for runtime_id, state in pairs(runtimes) do
+      queue_runtime_event(state, {
+        type = "status", runtime_id = runtime_id, status = "error",
+        message = options.storage_error, offset = state.newest_offset,
+      })
+    end
+    return false
+  end
 
   local function add_client(connection)
     served = true
@@ -1431,7 +1530,11 @@ function Agent.run(options)
       if not ok then remove_client(index) end
     end
 
-    poll_runtimes(service, runtimes)
+    if check_storage() then
+      poll_runtimes(service, runtimes)
+    else
+      poll_degraded_runtimes(service, runtimes, options.storage_error)
+    end
     service.providers:poll {
       workspace_id = service.workspace_id,
       runtimes = runtimes,
