@@ -31,8 +31,9 @@ local function runtime_config()
         "/S", "/C",
         "powershell.exe -NoProfile -NonInteractive -Command "
           .. "\"$bytes = [byte[]]::new(" .. tostring(stress_output_bytes) .. "); "
-          .. "for ($i = 0; $i -lt $bytes.Length; $i += 3) { "
-          .. "$bytes[$i] = 88; $bytes[$i + 1] = 13; $bytes[$i + 2] = 10 }; "
+          .. "for ($i = 0; $i -lt $bytes.Length; $i += 4) { "
+          .. "$bytes[$i] = 27; $bytes[$i + 1] = 91; "
+          .. "$bytes[$i + 2] = 48; $bytes[$i + 3] = 109 }; "
           .. "[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length); "
           .. "Start-Sleep -Seconds 4\"",
       },
