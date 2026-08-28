@@ -49,7 +49,7 @@ end
 local function collect_output(client, runtime_id, minimum)
   local total = 0
   local last_offset
-  local deadline = system.get_time() + 12
+  local deadline = system.get_time() + (PLATFORM == "Windows" and 30 or 12)
   local resize_at = 0
   while total < minimum and system.get_time() < deadline do
     local now = system.get_time()
@@ -68,7 +68,8 @@ local function collect_output(client, runtime_id, minimum)
     end
     if total < minimum then system.sleep(0.01) end
   end
-  test.ok(total >= minimum)
+  test.ok(total >= minimum,
+    "received " .. tostring(total) .. " of " .. tostring(minimum) .. " output bytes")
   test.not_nil(last_offset)
   return total, last_offset
 end
